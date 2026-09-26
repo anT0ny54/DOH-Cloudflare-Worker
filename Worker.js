@@ -1,10 +1,10 @@
 /**
- * VERSION: 0.1.0
+ * VERSION: 0.1.2
  * GITHUB: https://github.com/anT0ny54/DOH-Cloudflare-Worker
  * Runtime: Cloudflare Workers Module Syntax
  */
 
-const VERSION = '0.1.0';
+const VERSION = '0.1.2';
 
 const CONFIG = {
   DNS_PATH: '/dns-query',
@@ -31,6 +31,7 @@ const CONFIG = {
   // DoH packets should be tiny. Reject oversize input before buffering it when
   // Content-Length is available, and stream-limit unknown-length POST bodies.
   MAX_DNS_MESSAGE_BYTES: 4096,
+  MAX_DNS_RESPONSE_BYTES: 65535,
   MAX_GET_DNS_CHARS: 5462,
 
   // Intelligent hedging: start with one resolver, then add a backup only when
@@ -348,6 +349,8 @@ function decodeBase64Url(input) {
   }
 }
 
+// Strictly validate the incoming DNS query while avoiding qname/string allocations.
+// The request path only needs the original DNS transaction ID after validation.
 function parseDNSQuestion(packet) {
   const bytes = packet instanceof Uint8Array ? packet : new Uint8Array(packet);
 
@@ -366,13 +369,23 @@ function parseDNSQuestion(packet) {
     return { ok: false, error: 'DNS query expected, got response' };
   }
 
+  const opcode = (flags >>> 11) & 0x0f;
+  if (opcode !== 0) {
+    return { ok: false, error: 'Only standard DNS queries are supported' };
+  }
+
+  // Bit 6 of the DNS flags word remains reserved; modern DNS uses bits 5/4
+  // for DNSSEC AD/CD semantics, so only the actual reserved Z bit is rejected.
+  if ((flags & 0x0040) !== 0) {
+    return { ok: false, error: 'Reserved DNS flag bit is set' };
+  }
+
   if (qdcount !== 1 || ancount !== 0 || nscount !== 0) {
     return { ok: false, error: 'Invalid DNS query section counts' };
   }
 
   let offset = 12;
-  const labels = [];
-  let qnameLength = 0;
+  let wireNameLength = 1; // Includes the terminating zero octet.
   let terminated = false;
 
   while (offset < bytes.length) {
@@ -384,45 +397,46 @@ function parseDNSQuestion(packet) {
     }
 
     if ((len & 0xc0) !== 0) {
-      return { ok: false, error: 'Compressed question names are not accepted' };
+      return { ok: false, error: 'Invalid DNS label encoding' };
     }
 
     if (len > 63 || offset + len > bytes.length) {
       return { ok: false, error: 'Invalid DNS question name' };
     }
 
-    qnameLength += len + (labels.length ? 1 : 0);
-    if (qnameLength > 253) {
+    wireNameLength += 1 + len;
+    if (wireNameLength > 255) {
       return { ok: false, error: 'DNS question name too long' };
     }
 
-    let label = '';
-    for (let i = 0; i < len; i++) {
-      label += String.fromCharCode(bytes[offset++]).toLowerCase();
-    }
-
-    labels.push(label);
+    offset += len;
   }
 
   if (!terminated || offset + 4 > bytes.length) {
     return { ok: false, error: 'Incomplete DNS question' };
   }
 
-  const qtype = (bytes[offset] << 8) | bytes[offset + 1];
-  const qclass = (bytes[offset + 2] << 8) | bytes[offset + 3];
-  const qname = labels.join('.') || '.';
+  // QTYPE + QCLASS.
+  offset += 4;
+
+  // Additional records are allowed for EDNS(0) and other standards-compliant
+  // DNS extensions. Validate their wire structure instead of rejecting all
+  // packets with ARCOUNT > 0.
+  for (let i = 0; i < arcount; i++) {
+    const rr = readResourceRecord(bytes, offset);
+    if (!rr) {
+      return { ok: false, error: 'Invalid DNS additional section' };
+    }
+    offset = rr.end;
+  }
+
+  if (offset !== bytes.length) {
+    return { ok: false, error: 'Trailing data after DNS message' };
+  }
 
   return {
     ok: true,
-    id,
-    qname,
-    qtype,
-    qclass,
-    flags,
-    arcount,
-    // Kept for health/debugging without forcing every request through a more
-    // expensive DNS/EDNS parser. The cache key still covers the whole query.
-    questionKey: `${qname}|${qtype}|${qclass}|${flags}`
+    id
   };
 }
 
@@ -432,15 +446,6 @@ function normalizeDNSResponseID(responseBuffer) {
   copy.set(bytes);
   copy[0] = 0;
   copy[1] = 0;
-  return copy.buffer;
-}
-
-function patchDNSResponseID(responseBuffer, queryID) {
-  const bytes = new Uint8Array(responseBuffer);
-  const copy = new Uint8Array(bytes.length);
-  copy.set(bytes);
-  copy[0] = (queryID >> 8) & 0xff;
-  copy[1] = queryID & 0xff;
   return copy.buffer;
 }
 
@@ -580,15 +585,23 @@ async function resolveWithHedging(nodes, packet, expectedID) {
 }
 
 async function raceUntilActiveSettles(active, timeoutMs) {
+  let timeoutHandle;
   const timer = new Promise((resolve) => {
-    setTimeout(() => resolve({ type: 'timer' }), timeoutMs);
+    timeoutHandle = setTimeout(() => resolve({ type: 'timer' }), timeoutMs);
   });
 
   const settled = [...active.values()].map((promise) =>
     promise.then((result) => ({ type: 'result', ...result }))
   );
 
-  return Promise.race([timer, ...settled]);
+  try {
+    return await Promise.race([timer, ...settled]);
+  } finally {
+    // Whichever of "settled" or "timer" wins, the loser's timer must not
+    // linger: an uncleared hedge timer keeps firing on every subsequent
+    // iteration and can outlive the request that created it.
+    clearTimeout(timeoutHandle);
+  }
 }
 
 function abortAttempts(controllers, winnerNode) {
@@ -629,8 +642,8 @@ async function relay(node, packet, expectedID, signal) {
       throw new Error(`Upstream HTTP ${res.status}`);
     }
 
-    const body = await res.arrayBuffer();
-    const validation = validateDNSResponse(body, expectedID);
+    const body = await readBoundedDNSResponse(res);
+    const validation = validateDNSResponse(body, expectedID, packet);
 
     if (!validation.ok) {
       throw new Error(validation.error);
@@ -675,7 +688,7 @@ async function relay(node, packet, expectedID, signal) {
   }
 }
 
-function validateDNSResponse(responseBuffer, expectedID) {
+function validateDNSResponse(responseBuffer, expectedID, requestPacket) {
   const bytes = new Uint8Array(responseBuffer);
 
   if (bytes.length < 12) return { ok: false, error: 'Upstream returned short DNS response' };
@@ -683,11 +696,133 @@ function validateDNSResponse(responseBuffer, expectedID) {
   const id = (bytes[0] << 8) | bytes[1];
   const flags = (bytes[2] << 8) | bytes[3];
   const rcode = flags & 0x000f;
+  const opcode = (flags >>> 11) & 0x0f;
+  const qdcount = (bytes[4] << 8) | bytes[5];
+  const ancount = (bytes[6] << 8) | bytes[7];
+  const nscount = (bytes[8] << 8) | bytes[9];
+  const arcount = (bytes[10] << 8) | bytes[11];
 
   if (id !== expectedID) return { ok: false, error: 'Upstream response ID mismatch' };
   if ((flags & 0x8000) === 0) return { ok: false, error: 'Upstream returned a DNS query, not response' };
+  if (opcode !== 0) return { ok: false, error: 'Upstream returned unsupported DNS opcode' };
+  if ((flags & 0x0040) !== 0) return { ok: false, error: 'Upstream response has reserved DNS flag bit set' };
+  if (qdcount !== 1) return { ok: false, error: 'Upstream returned invalid question count' };
+  if (!requestPacket) return { ok: false, error: 'Original DNS query is required for response validation' };
+
+  const request = new Uint8Array(requestPacket);
+  if (request.length < 12) return { ok: false, error: 'Original DNS query is invalid' };
+
+  const requestQuestionEnd = getDNSQuestionEnd(request);
+  const responseQuestionEnd = getDNSQuestionEnd(bytes);
+  if (requestQuestionEnd < 0 || responseQuestionEnd < 0) {
+    return { ok: false, error: 'Upstream returned malformed DNS question' };
+  }
+
+  const requestQuestion = request.subarray(12, requestQuestionEnd);
+  const responseQuestion = bytes.subarray(12, responseQuestionEnd);
+  if (requestQuestion.length !== responseQuestion.length) {
+    return { ok: false, error: 'Upstream response question mismatch' };
+  }
+
+  for (let i = 0; i < requestQuestion.length; i++) {
+    if (!dnsQuestionByteEquals(requestQuestion[i], responseQuestion[i])) {
+      return { ok: false, error: 'Upstream response question mismatch' };
+    }
+  }
+
+  let offset = responseQuestionEnd;
+  const counts = [ancount, nscount, arcount];
+  for (const count of counts) {
+    for (let i = 0; i < count; i++) {
+      const rr = readResourceRecord(bytes, offset);
+      if (!rr) return { ok: false, error: 'Upstream returned malformed DNS resource record' };
+      offset = rr.end;
+    }
+  }
+
+  if (offset !== bytes.length) {
+    return { ok: false, error: 'Upstream returned trailing DNS data' };
+  }
 
   return { ok: true, rcode };
+}
+
+// DNS names are case-insensitive (RFC 1035 3.1 / RFC 4343). A compliant
+// resolver is free to echo the question back with different letter case
+// than the outgoing query (some implementations normalize case, and
+// case-randomization ["0x20 encoding"] clients rely on this exact byte
+// range for anti-spoofing entropy), so an exact byte-for-byte compare would
+// wrongly treat those legitimate answers as a mismatch and fail the whole
+// upstream. Label-length octets are always <= 63 (0x3F) and QTYPE/QCLASS
+// octets used by this Worker never fall in the ASCII letter ranges either,
+// so folding case only for actual A-Z/a-z bytes cannot misclassify
+// structural framing bytes as name content.
+function dnsQuestionByteEquals(a, b) {
+  if (a === b) return true;
+  const aIsLetter = (a >= 0x41 && a <= 0x5a) || (a >= 0x61 && a <= 0x7a);
+  const bIsLetter = (b >= 0x41 && b <= 0x5a) || (b >= 0x61 && b <= 0x7a);
+  return aIsLetter && bIsLetter && (a | 0x20) === (b | 0x20);
+}
+
+function getDNSQuestionEnd(bytes) {
+  if (bytes.length < 12) return -1;
+
+  const qdcount = (bytes[4] << 8) | bytes[5];
+  if (qdcount !== 1) return -1;
+
+  let offset = 12;
+  const nameEnd = skipDNSName(bytes, offset);
+  if (nameEnd < 0 || nameEnd + 4 > bytes.length) return -1;
+  return nameEnd + 4;
+}
+
+async function readBoundedDNSResponse(res) {
+  const contentLength = res.headers.get('content-length');
+  if (contentLength !== null) {
+    const n = Number(contentLength);
+    if (Number.isFinite(n) && n > CONFIG.MAX_DNS_RESPONSE_BYTES) {
+      throw new Error('Upstream DNS response too large');
+    }
+  }
+
+  const reader = res.body?.getReader();
+  if (!reader) {
+    const body = new Uint8Array(await res.arrayBuffer());
+    if (body.byteLength > CONFIG.MAX_DNS_RESPONSE_BYTES) {
+      throw new Error('Upstream DNS response too large');
+    }
+    return body.buffer;
+  }
+
+  const chunks = [];
+  let total = 0;
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!value || value.byteLength === 0) continue;
+
+      total += value.byteLength;
+      if (total > CONFIG.MAX_DNS_RESPONSE_BYTES) {
+        await reader.cancel('dns-response-too-large');
+        throw new Error('Upstream DNS response too large');
+      }
+      chunks.push(value);
+    }
+  } finally {
+    try { await reader.releaseLock(); } catch (_) {}
+  }
+
+  if (chunks.length === 1) return new Uint8Array(chunks[0]).buffer;
+
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out.buffer;
 }
 
 function anySignal(signals) {
@@ -841,22 +976,41 @@ function getDNSCacheTTL(responseBuffer) {
 }
 
 function skipDNSName(bytes, offset) {
+  if (offset < 0 || offset >= bytes.length) return -1;
+
   let pos = offset;
   let jumps = 0;
+  let end = -1;
+  const visited = new Set();
 
   while (pos < bytes.length) {
+    const labelOffset = pos;
     const len = bytes[pos++];
-    if (len === 0) return pos;
+
+    if (len === 0) {
+      if (end < 0) end = pos;
+      return end;
+    }
 
     if ((len & 0xc0) === 0xc0) {
       if (pos >= bytes.length) return -1;
-      return pos + 1;
+
+      const pointer = ((len & 0x3f) << 8) | bytes[pos];
+      pos += 1;
+
+      // Compression pointers must reference a prior byte in this message.
+      if (pointer < 12 || pointer >= labelOffset) return -1;
+      if (visited.has(pointer)) return -1;
+      visited.add(pointer);
+
+      if (end < 0) end = pos;
+      if (++jumps > 255) return -1;
+      pos = pointer;
+      continue;
     }
 
     if ((len & 0xc0) !== 0 || len > 63 || pos + len > bytes.length) return -1;
     pos += len;
-
-    if (++jumps > 255) return -1;
   }
 
   return -1;
@@ -1131,56 +1285,82 @@ function renderUI(host) {
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#020617">
     <title>Secure DNS over HTTPS (DoH) Pro</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🛡️</text></svg>">
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;700;900&family=Vazirmatn:wght@400;700;900&display=swap');
-        body { background: #020617; color: #cbd5e1; font-family: 'Inter', 'Vazirmatn', sans-serif; overflow-x: hidden; }
+        :root { color-scheme: dark; }
+        html { scroll-behavior: smooth; }
+        body {
+            background: #020617;
+            background-image:
+                radial-gradient(circle at 15% 0%, rgba(14, 165, 233, 0.10), transparent 45%),
+                radial-gradient(circle at 85% 20%, rgba(16, 185, 129, 0.08), transparent 40%),
+                linear-gradient(rgba(148, 163, 184, 0.05) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(148, 163, 184, 0.05) 1px, transparent 1px);
+            background-size: auto, auto, 42px 42px, 42px 42px;
+            color: #cbd5e1;
+            font-family: 'Inter', 'Vazirmatn', sans-serif;
+            overflow-x: hidden;
+            padding-top: env(safe-area-inset-top, 0px);
+            padding-bottom: env(safe-area-inset-bottom, 0px);
+        }
         .cyber-glass { background: rgba(15, 23, 42, 0.7); backdrop-filter: blur(15px); border: 1px solid rgba(0, 243, 255, 0.08); }
         .lang-fa { direction: rtl; font-family: 'Vazirmatn', sans-serif; }
         .nav-active { background: #0ea5e9; color: white !important; border-color: #38bdf8 !important; box-shadow: 0 0 15px rgba(14, 165, 233, 0.3); }
         .panel { display: none; } .panel-active { display: block; animation: fadeInUp 0.3s ease-out; }
         @keyframes fadeInUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-        code { color: #22d3ee; font-family: monospace; background: #000; padding: 3px 7px; border-radius: 6px; }
-        .btn-tab { transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1); border: 1px solid #1e293b; }
+        code { color: #22d3ee; font-family: monospace; background: #000; padding: 3px 7px; border-radius: 6px; word-break: break-all; }
+        .btn-tab { transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1); border: 1px solid #1e293b; }
+        .btn-tab:active { transform: scale(0.95); }
+        .no-scrollbar { scrollbar-width: none; -ms-overflow-style: none; }
         .no-scrollbar::-webkit-scrollbar { display: none; }
+        /* Mobile-first hero type: never larger than what a small phone can wrap cleanly. */
+        .hero-title { font-size: clamp(2.5rem, 9vw, 4.5rem); line-height: 1.05; }
+        /* The endpoint is a long string; shrink it before it ever forces horizontal scroll. */
+        #linkInp { font-size: clamp(0.7rem, 3vw, 0.95rem); }
+        @media (max-width: 480px) {
+            #tutorialNav { flex-wrap: nowrap; overflow-x: auto; justify-content: flex-start; scroll-snap-type: x mandatory; padding: 0 4px; }
+            #tutorialNav .btn-tab { flex: 0 0 auto; scroll-snap-align: start; white-space: nowrap; }
+        }
     </style>
 </head>
 <body class="p-4 md:p-12">
 
     <!-- LANGUAGE SWITCHER -->
-    <div class="fixed top-6 right-6 z-50">
-        <button onclick="document.getElementById('langMenu').classList.toggle('hidden')" class="cyber-glass px-6 py-3 rounded-2xl flex items-center gap-4 text-xs font-bold border-cyan-500/20 hover:scale-105 transition-all shadow-2xl">
+    <div class="fixed z-50" style="top: calc(1.5rem + env(safe-area-inset-top, 0px)); right: 1.5rem;">
+        <button onclick="toggleLangMenu(event)" aria-haspopup="true" aria-expanded="false" id="langBtn" class="cyber-glass px-5 py-3 md:px-6 rounded-2xl flex items-center gap-3 md:gap-4 text-xs font-bold border-cyan-500/20 hover:scale-105 active:scale-95 transition-all shadow-2xl">
             🌐 <span id="currentLang">LANGUAGE</span>
         </button>
         <div id="langMenu" class="hidden absolute right-0 mt-3 cyber-glass p-2 rounded-2xl w-44 shadow-2xl border-slate-800">
-            <button onclick="changeLang('en')" class="w-full text-left p-3 hover:bg-sky-600 rounded-xl text-xs mb-1">ENGLISH</button>
-            <button onclick="changeLang('fa')" class="w-full text-right p-3 hover:bg-emerald-600 rounded-xl text-xs mb-1">فارسی</button>
-            <button onclick="changeLang('zh')" class="w-full text-left p-3 hover:bg-teal-600 rounded-xl text-xs">简体中文</button>
+            <button onclick="changeLang('en')" class="w-full text-left p-3 hover:bg-sky-600 active:scale-95 rounded-xl text-xs mb-1 transition-all">ENGLISH</button>
+            <button onclick="changeLang('fa')" class="w-full text-right p-3 hover:bg-emerald-600 active:scale-95 rounded-xl text-xs mb-1 transition-all">فارسی</button>
+            <button onclick="changeLang('zh')" class="w-full text-left p-3 hover:bg-teal-600 active:scale-95 rounded-xl text-xs transition-all">简体中文</button>
         </div>
     </div>
 
     <div class="max-w-4xl mx-auto">
         <header class="text-center py-16 md:py-24">
-            <h1 class="text-5xl md:text-7xl font-black text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 via-sky-300 to-emerald-400" id="mainTitle">Secure DNS over HTTPS</h1>
-            <p id="subTag" class="mt-8 text-slate-500 font-bold uppercase tracking-[0.3em] text-[10px] md:text-xs">Edge Resolve Network • Intelligent HaGeZi Failover</p>
+            <h1 class="hero-title font-black text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 via-sky-300 to-emerald-400" id="mainTitle">Secure DNS over HTTPS</h1>
+            <p id="subTag" class="mt-8 text-slate-500 font-bold uppercase tracking-[0.2em] md:tracking-[0.3em] text-[10px] md:text-xs px-4">Edge Resolve Network • Intelligent HaGeZi Failover</p>
         </header>
 
-        <section class="cyber-glass rounded-[3rem] p-8 md:p-14 mb-10 text-center">
+        <section class="cyber-glass rounded-[2rem] md:rounded-[3rem] p-6 md:p-14 mb-10 text-center">
             <div class="mb-6">
                 <span class="text-[11px] font-black text-cyan-500 tracking-widest uppercase mb-4 block" id="labelUrl">Endpoint URL</span>
-                <input id="linkInp" value="${endpoint}" readonly class="w-full bg-black/40 border border-slate-800 p-5 rounded-2xl text-cyan-300 font-mono text-center text-sm outline-none focus:border-cyan-500/50 shadow-inner">
+                <input id="linkInp" value="${endpoint}" readonly onclick="this.select()" class="w-full bg-black/40 border border-slate-800 p-4 md:p-5 rounded-2xl text-cyan-300 font-mono text-center outline-none focus:border-cyan-500/50 shadow-inner">
             </div>
-            <button onclick="copyURL()" class="bg-cyan-600 hover:bg-cyan-400 text-black font-black px-12 py-5 rounded-2xl transition-all shadow-xl active:scale-95">
+            <button onclick="copyURL()" class="w-full md:w-auto bg-cyan-600 hover:bg-cyan-400 text-black font-black px-12 py-5 rounded-2xl transition-all shadow-xl active:scale-95">
                 <span id="txtCopy">COPY ENDPOINT</span>
             </button>
         </section>
 
         <!-- TUTORIAL SECTION -->
         <div class="mb-16">
-            <nav id="tutorialNav" class="flex flex-wrap gap-3 justify-center mb-8">
+            <nav id="tutorialNav" class="no-scrollbar flex flex-wrap gap-3 justify-center mb-8">
                 <button onclick="tab('chrome', this)" id="btnC" class="btn-tab px-6 py-3 rounded-2xl text-[11px] font-black uppercase text-slate-400 nav-active">Chrome / Brave / Edge</button>
                 <button onclick="tab('firefox', this)" id="btnF" class="btn-tab px-6 py-3 rounded-2xl text-[11px] font-black uppercase text-slate-400">Firefox</button>
                 <button onclick="tab('mobile', this)" id="btnM" class="btn-tab px-6 py-3 rounded-2xl text-[11px] font-black uppercase text-slate-400">Android / iOS</button>
@@ -1282,10 +1462,30 @@ function renderUI(host) {
             }
         };
 
+        function toggleLangMenu(evt) {
+            evt.stopPropagation();
+            const menu = document.getElementById('langMenu');
+            const willOpen = menu.classList.contains('hidden');
+            menu.classList.toggle('hidden');
+            document.getElementById('langBtn').setAttribute('aria-expanded', String(willOpen));
+        }
+
+        document.addEventListener('click', (evt) => {
+            const menu = document.getElementById('langMenu');
+            const btn = document.getElementById('langBtn');
+            if (!menu.classList.contains('hidden') && !menu.contains(evt.target) && !btn.contains(evt.target)) {
+                menu.classList.add('hidden');
+                btn.setAttribute('aria-expanded', 'false');
+            }
+        });
+
         function changeLang(c) {
+            c = I18N[c] ? c : 'en';
             localStorage.setItem('doc_v6', c);
             const l = I18N[c];
             document.body.classList.toggle('lang-fa', c === 'fa');
+            document.documentElement.lang = c;
+            document.documentElement.dir = c === 'fa' ? 'rtl' : 'ltr';
             document.getElementById('currentLang').innerText = l.curL;
             document.getElementById('mainTitle').innerText = l.main;
             document.getElementById('subTag').innerText = l.sub;
@@ -1304,6 +1504,7 @@ function renderUI(host) {
             document.getElementById('whyH').innerText = l.whyH;
             document.getElementById('whyT').innerHTML = l.whyT;
             document.getElementById('langMenu').classList.add('hidden');
+            document.getElementById('langBtn').setAttribute('aria-expanded', 'false');
         }
 
         function tab(id, el) {

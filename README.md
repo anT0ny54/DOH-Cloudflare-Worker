@@ -49,6 +49,17 @@ Responses cached internally use DNS TTL-derived expiration. The response transac
 
 DoH DNS messages are normally tiny, so this Worker rejects messages larger than 4 KiB. It checks `Content-Length` before reading a POST when available and also stream-limits chunked/unknown-length bodies. This is intentionally much lower than Cloudflare's platform-level 100 MB Free-plan request-body limit and avoids spending memory/CPU on oversized abuse traffic.
 
+### Upstream response validation
+
+Every upstream reply is checked before it is trusted or cached, not just parsed for its RCODE:
+
+- The response body is read with the same streaming/`Content-Length` size guard as inbound requests (capped at 64 KiB), so a misbehaving or compromised upstream cannot force this Worker to buffer an unbounded body.
+- The transaction ID, QR bit, OPCODE, reserved flag bit, and QDCOUNT are all revalidated on the response, mirroring the checks already applied to the inbound query.
+- The response's question section is compared byte-for-byte against the question this Worker actually sent, closing off a class of cache-poisoning/off-path spoofing where an attacker (or a broken upstream) answers a different question than the one asked. The comparison is case-insensitive for the ASCII letters in the name, since DNS names are case-insensitive by specification (RFC 1035 §3.1) and a compliant resolver may echo the question back with different letter case than it was sent in.
+- Answer/authority/additional records in the response are walked with the same resource-record parser used for TTL/cache logic, so a response with a truncated or malformed record is rejected instead of silently mis-parsed.
+
+A response that fails any of these checks is treated as a failed attempt for that upstream (penalizing its health score and triggering failover to the next resolver), the same as an HTTP error or a timeout.
+
 ## Deploy with Wrangler
 
 The ZIP includes `wrangler.toml` with a `DNS_RATE_LIMITER` binding configured for **100 requests / 60 seconds**. With Wrangler, deploy from the folder containing `Worker.js` and `wrangler.toml` so the binding is created/used. If the Worker is uploaded through a method that does not apply the Wrangler binding, the script falls back to an in-memory per-isolate limiter.
@@ -94,6 +105,20 @@ https://dns.yourdomain.com/dns-query
 ```
 
 ## Testing
+
+Run the focused parser regression suite with Node.js:
+
+```sh
+node --test tests/parseDNSQuestion.test.mjs
+```
+
+Run the complete Worker integration suite:
+
+```sh
+node --test tests/all-features.integration.test.mjs
+```
+
+The parser suite covers valid DNS/EDNS(0) queries, transaction-ID preservation, section-count validation, malformed/truncated names, compression and reserved label encodings, maximum-name boundaries, unsupported opcodes, malformed Additional records, and trailing-byte rejection. The integration suite exercises dashboard routes/accessibility, request-size and HTTP validation, GET/POST DoH, L1/L2 caching, ID restoration, request coalescing, resolver failover/hedging/timeouts, upstream response-size and wire-format validation, case-insensitive question matching against a case-folding upstream, DNS degradation handling, TTL aging and negative caching, native/local rate limiting, and bounded in-memory state.
 
 A healthy request should return:
 

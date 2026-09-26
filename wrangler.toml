@@ -1,0 +1,11 @@
+name = "secure-dns-over-https"
+main = "Worker.js"
+compatibility_date = "2026-09-26"
+
+[[ratelimits]]
+name = "DNS_RATE_LIMITER"
+namespace_id = "1001"
+
+[ratelimits.simple]
+limit = 100
+period = 60

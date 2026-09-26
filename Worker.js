@@ -1236,7 +1236,7 @@ function renderUI(host) {
 
         <footer class="mt-32 pb-20 border-t border-slate-900 flex flex-col md:flex-row justify-between items-center opacity-60 gap-8">
             <div>
-                <span class="text-[10px] font-black tracking-widest text-cyan-600 block mb-1">DOH CORE: NEPTUNE-V${VERSION}</span>
+                <span class="text-[10px] font-black tracking-widest text-cyan-600 block mb-1">Secure DNS over HTTPS v${VERSION}</span>
                 <p class="text-[9px] uppercase">Built with Edge-Computing Infrastructure</p>
             </div>
             <div class="flex gap-10 font-bold text-[10px] uppercase">

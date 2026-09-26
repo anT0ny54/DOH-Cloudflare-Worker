@@ -117,3 +117,14 @@ The `/health` endpoint reports the three resolver scores plus L1/L2 cache and in
 ## Important limitation
 
 This is **DNS encryption**, not a VPN. It protects DNS traffic between the client and this Worker, but it does not hide destination IP addresses or guarantee bypass of IP, SNI, TLS, QUIC, or other network-level filtering.
+
+## 🖥️ **Live Demo For This Project :** [Secure DNS over HTTPS](https://dns.mydoh.workers.dev/).
+
+## Credits
+
+Based on [Secure DNS over HTTPS Cloudflare Worker](https://github.com/TheGreatAzizi/Secure-DNS-over-HTTPS-Cloudflare-Worker) by M.M.Azizi (MIT).
+
+## License
+
+See the repository's [LICENSE](LICENSE) file.
+

@@ -9,10 +9,17 @@ const VERSION = '0.1.0';
 const CONFIG = {
   DNS_PATH: '/dns-query',
 
-  // Small per-isolate cache. This is a hot-path optimization; correctness does
-  // not depend on cache state being globally shared.
-  CACHE_TTL_SECONDS: 45,
+  // Two-level DNS cache. L1 is an isolate-local hot cache; L2 is the
+  // Cloudflare Cache API for requests handled by the same data center.
+  // The cache key is derived from the complete DNS wire query with the ID
+  // normalized, so GET and POST can share cached answers safely.
+  EDGE_CACHE_ENABLED: true,
+  EDGE_CACHE_PATH: '/__doh-cache/v1',
+  LOCAL_CACHE_MAX_TTL_SECONDS: 300,
+  EDGE_CACHE_MAX_TTL_SECONDS: 3600,
+  EDGE_CACHE_MIN_TTL_SECONDS: 1,
   MAX_CACHE_ENTRIES: 512,
+  MAX_INFLIGHT_ENTRIES: 256,
 
   // Preferred: Cloudflare's native Rate Limiting binding (100/60s per IP).
   // Fallback: lightweight per-isolate fixed-window limiter when the binding is
@@ -64,6 +71,7 @@ const RESOLVER_NODES = HAGEZI_UPSTREAMS.map((url, order) => ({
 const APP_STATE = {
   cache: new Map(),
   throttle: new Map(),
+  inflight: new Map(),
   primaryCursor: 0
 };
 
@@ -80,7 +88,7 @@ export default {
         });
       }
 
-      return handleDNS(req, url);
+      return handleDNS(req, url, ctx);
     }
 
     if (url.pathname === '/health') {
@@ -97,7 +105,7 @@ export default {
   }
 };
 
-async function handleDNS(req, url) {
+async function handleDNS(req, url, ctx) {
   const methodError = validateMethod(req.method);
   if (methodError) return methodError;
 
@@ -125,27 +133,110 @@ async function handleDNS(req, url) {
   }
 
   const cacheKey = await makeCacheKey(payload);
-  const hit = getCache(cacheKey);
 
-  if (hit) {
-    const responseBody = patchDNSResponseID(hit.body, parsed.id);
+  // L1: cheapest possible path.
+  const localHit = getCache(cacheKey);
+  if (localHit) {
+    const ageSeconds = Math.max(0, Math.floor((Date.now() - localHit.storedAt) / 1000));
+    const responseBody = patchDNSResponseForAge(localHit.body, parsed.id, ageSeconds);
     return dnsResponse(responseBody, {
-      'x-cache': 'HIT',
+      'x-cache': 'L1-HIT',
+      'x-edge-cache': 'SKIP',
       'x-upstreams': '0'
     });
   }
 
-  const resolvers = selectRacers(RESOLVER_NODES);
+  // Coalesce concurrent misses for the same DNS packet inside an isolate.
+  // This prevents a burst of identical cold queries from multiplying upstream
+  // traffic before the first response has reached either cache.
+  const existing = APP_STATE.inflight.get(cacheKey);
+  if (existing) {
+    const shared = await existing;
+    const ageSeconds = Math.max(0, Math.floor((Date.now() - shared.storedAt) / 1000));
+    setCache(cacheKey, shared.body, Math.min(shared.ttlSeconds, CONFIG.LOCAL_CACHE_MAX_TTL_SECONDS), shared.storedAt);
+    const responseBody = patchDNSResponseForAge(shared.body, parsed.id, ageSeconds);
+    return dnsResponse(responseBody, {
+      'x-cache': 'COALESCED',
+      'x-edge-cache': 'SKIP',
+      'x-upstreams': '0',
+      'x-winner': sanitizeHeaderValue(shared.url),
+      'x-winner-lat': `${shared.latencyMs}ms`
+    });
+  }
 
-  try {
+  // L2: Cache API. This runs after the rate limiter, so enabling this cache
+  // does not bypass the per-IP /dns-query protection.
+  if (CONFIG.EDGE_CACHE_ENABLED) {
+    const edgeHit = await getEdgeCache(cacheKey, parsed.id, url.origin);
+    if (edgeHit) {
+      setCache(cacheKey, edgeHit.body, Math.min(edgeHit.ttlSeconds, CONFIG.LOCAL_CACHE_MAX_TTL_SECONDS), edgeHit.storedAt);
+      return dnsResponse(edgeHit.responseBody, {
+        'x-cache': 'L2-HIT',
+        'x-edge-cache': 'HIT',
+        'x-upstreams': '0'
+      });
+    }
+  }
+
+  // A second in-flight check closes the race between the L2 lookup and creating
+  // a new upstream job.
+  const raced = APP_STATE.inflight.get(cacheKey);
+  if (raced) {
+    const shared = await raced;
+    const ageSeconds = Math.max(0, Math.floor((Date.now() - shared.storedAt) / 1000));
+    setCache(cacheKey, shared.body, Math.min(shared.ttlSeconds, CONFIG.LOCAL_CACHE_MAX_TTL_SECONDS), shared.storedAt);
+    const responseBody = patchDNSResponseForAge(shared.body, parsed.id, ageSeconds);
+    return dnsResponse(responseBody, {
+      'x-cache': 'COALESCED',
+      'x-edge-cache': 'SKIP',
+      'x-upstreams': '0',
+      'x-winner': sanitizeHeaderValue(shared.url),
+      'x-winner-lat': `${shared.latencyMs}ms`
+    });
+  }
+
+  const resolvers = selectRacers(RESOLVER_NODES);
+  const job = (async () => {
     const result = await resolveWithHedging(resolvers, payload, parsed.id);
+    const storedAt = Date.now();
+    let ttlSeconds = 0;
+    let normalizedBody = result.body;
 
     if (isCacheableDNSResponse(result.body)) {
-      setCache(cacheKey, normalizeDNSResponseID(result.body), CONFIG.CACHE_TTL_SECONDS);
+      ttlSeconds = getDNSCacheTTL(result.body);
+      if (ttlSeconds > 0) {
+        normalizedBody = normalizeDNSResponseID(result.body);
+        const localTTL = Math.min(ttlSeconds, CONFIG.LOCAL_CACHE_MAX_TTL_SECONDS);
+        setCache(cacheKey, normalizedBody, localTTL, storedAt);
+        if (CONFIG.EDGE_CACHE_ENABLED) {
+          ctx.waitUntil(putEdgeCache(
+            cacheKey,
+            normalizedBody,
+            Math.min(ttlSeconds, CONFIG.EDGE_CACHE_MAX_TTL_SECONDS),
+            storedAt,
+            url.origin
+          ));
+        }
+      }
     }
 
+    return {
+      ...result,
+      body: normalizedBody,
+      ttlSeconds,
+      storedAt
+    };
+  })();
+
+  APP_STATE.inflight.set(cacheKey, job);
+  trimMap(APP_STATE.inflight, CONFIG.MAX_INFLIGHT_ENTRIES);
+
+  try {
+    const result = await job;
+    const responseBody = patchDNSResponseForAge(result.body, parsed.id, 0);
     const headers = {
       'x-cache': 'MISS',
+      'x-edge-cache': CONFIG.EDGE_CACHE_ENABLED ? 'MISS' : 'DISABLED',
       'x-upstreams': String(result.attempts),
       'x-winner': sanitizeHeaderValue(result.url),
       'x-winner-lat': `${result.latencyMs}ms`
@@ -153,12 +244,14 @@ async function handleDNS(req, url) {
 
     if (result.degraded) headers['x-dns-degraded'] = '1';
 
-    return dnsResponse(result.body, headers);
+    return dnsResponse(responseBody, headers);
   } catch (err) {
     return textResponse('Global resolving failed', 502, {
       'cache-control': 'no-store',
       'x-upstreams': String(err.attempts || resolvers.length)
     });
+  } finally {
+    if (APP_STATE.inflight.get(cacheKey) === job) APP_STATE.inflight.delete(cacheKey);
   }
 }
 
@@ -457,10 +550,17 @@ async function resolveWithHedging(nodes, packet, expectedID) {
       }
 
       if (nextIndex < nodes.length) {
-        startAttempt(nodes[nextIndex++]);
-        hedgeDelay = nextIndex === 2
-          ? getSecondaryHedgeDelay()
-          : CONFIG.UPSTREAM_TIMEOUT_MS;
+        // If another backup is already in flight, give it a short chance to
+        // succeed before opening a third connection. A failed primary does not
+        // by itself justify three concurrent upstream requests.
+        if (active.size === 0) {
+          startAttempt(nodes[nextIndex++]);
+          hedgeDelay = nextIndex === 2
+            ? getSecondaryHedgeDelay()
+            : CONFIG.UPSTREAM_TIMEOUT_MS;
+        } else {
+          hedgeDelay = getSecondaryHedgeDelay();
+        }
       }
     }
 
@@ -628,17 +728,15 @@ function penalize(node, amount, error) {
 }
 
 async function makeCacheKey(packet) {
-  // Web Crypto is native in Workers and avoids a JS hash loop over every query.
-  // Normalize only the transaction ID so EDNS/options and DNS flags stay part of
-  // the cache key. This prevents collisions between materially different queries.
+  // One compact hash gives GET and POST the same cache namespace and avoids
+  // repeatedly parsing the DNS name/options just to build a string key.
   const bytes = packet instanceof Uint8Array ? packet : new Uint8Array(packet);
   const normalized = bytes.slice();
   normalized[0] = 0;
   normalized[1] = 0;
 
   const digest = await crypto.subtle.digest('SHA-256', normalized);
-  // 128 bits is ample for a small in-isolate cache and cuts string work in half.
-  const view = new Uint8Array(digest, 0, 16);
+  const view = new Uint8Array(digest, 0, 16); // 128-bit cache key
   let out = '';
   for (let i = 0; i < view.length; i++) out += view[i].toString(16).padStart(2, '0');
   return out;
@@ -648,24 +746,250 @@ function getCache(key) {
   const item = APP_STATE.cache.get(key);
   if (!item) return null;
 
-  if (Date.now() > item.expiresAt) {
+  if (Date.now() >= item.expiresAt) {
     APP_STATE.cache.delete(key);
     return null;
   }
 
-  // Simple LRU behavior: refresh insertion order on hit.
+  // LRU refresh.
   APP_STATE.cache.delete(key);
   APP_STATE.cache.set(key, item);
   return item;
 }
 
-function setCache(key, body, ttlSeconds) {
+function setCache(key, body, ttlSeconds, storedAt = Date.now()) {
+  const ttl = Math.max(1, Math.floor(ttlSeconds));
   APP_STATE.cache.set(key, {
     body,
-    expiresAt: Date.now() + ttlSeconds * 1000
+    storedAt,
+    expiresAt: storedAt + ttl * 1000
   });
 
   trimMap(APP_STATE.cache, CONFIG.MAX_CACHE_ENTRIES);
+}
+
+function getDNSCacheTTL(responseBuffer) {
+  const bytes = new Uint8Array(responseBuffer);
+  if (bytes.length < 12) return 0;
+
+  const flags = (bytes[2] << 8) | bytes[3];
+  if ((flags & 0x8000) === 0) return 0;
+  if ((flags & 0x0200) !== 0) return 0; // TC: do not cache truncated answers
+
+  const rcode = flags & 0x000f;
+  if (rcode !== 0 && rcode !== 3) return 0;
+
+  const qdcount = (bytes[4] << 8) | bytes[5];
+  const ancount = (bytes[6] << 8) | bytes[7];
+  const nscount = (bytes[8] << 8) | bytes[9];
+  const arcount = (bytes[10] << 8) | bytes[11];
+
+  let offset = 12;
+  for (let i = 0; i < qdcount; i++) {
+    offset = skipDNSName(bytes, offset);
+    if (offset < 0 || offset + 4 > bytes.length) return 0;
+    offset += 4;
+  }
+
+  let answerMin = Number.MAX_SAFE_INTEGER;
+  let authorityMin = Number.MAX_SAFE_INTEGER;
+  let soaNegativeMin = Number.MAX_SAFE_INTEGER;
+
+  const sections = [
+    ['answer', ancount],
+    ['authority', nscount],
+    ['additional', arcount]
+  ];
+
+  for (const [section, count] of sections) {
+    for (let i = 0; i < count; i++) {
+      const rr = readResourceRecord(bytes, offset);
+      if (!rr) return 0;
+      offset = rr.end;
+
+      // OPT and other meta records are not useful DNS answer TTLs here.
+      if (rr.type === 41) continue;
+
+      if (section === 'answer') {
+        answerMin = Math.min(answerMin, rr.ttl);
+      } else if (section === 'authority') {
+        authorityMin = Math.min(authorityMin, rr.ttl);
+        if (rr.type === 6 && rr.rdLength >= 20) {
+          const minimumOffset = findSOAMinimumOffset(bytes, rr.rdataOffset, rr.rdEnd);
+          if (minimumOffset >= 0) {
+            soaNegativeMin = Math.min(soaNegativeMin, readUint32(bytes, minimumOffset));
+          }
+        }
+      }
+    }
+  }
+
+  let ttl;
+  if (rcode === 3 || (rcode === 0 && ancount === 0)) {
+    ttl = Math.min(authorityMin, soaNegativeMin);
+  } else {
+    ttl = answerMin;
+  }
+
+  if (!Number.isFinite(ttl) || ttl <= 0) return 0;
+
+  return clamp(
+    Math.floor(ttl),
+    CONFIG.EDGE_CACHE_MIN_TTL_SECONDS,
+    CONFIG.EDGE_CACHE_MAX_TTL_SECONDS
+  );
+}
+
+function skipDNSName(bytes, offset) {
+  let pos = offset;
+  let jumps = 0;
+
+  while (pos < bytes.length) {
+    const len = bytes[pos++];
+    if (len === 0) return pos;
+
+    if ((len & 0xc0) === 0xc0) {
+      if (pos >= bytes.length) return -1;
+      return pos + 1;
+    }
+
+    if ((len & 0xc0) !== 0 || len > 63 || pos + len > bytes.length) return -1;
+    pos += len;
+
+    if (++jumps > 255) return -1;
+  }
+
+  return -1;
+}
+
+function readResourceRecord(bytes, offset) {
+  const nameEnd = skipDNSName(bytes, offset);
+  if (nameEnd < 0 || nameEnd + 10 > bytes.length) return null;
+
+  const type = (bytes[nameEnd] << 8) | bytes[nameEnd + 1];
+  const ttl = readUint32(bytes, nameEnd + 4);
+  const rdLength = (bytes[nameEnd + 8] << 8) | bytes[nameEnd + 9];
+  const rdataOffset = nameEnd + 10;
+  const rdEnd = rdataOffset + rdLength;
+
+  if (rdEnd > bytes.length) return null;
+  return {
+    type,
+    ttl,
+    rdLength,
+    rdataOffset,
+    rdEnd,
+    end: rdEnd
+  };
+}
+
+function findSOAMinimumOffset(bytes, rdataOffset, rdEnd) {
+  let pos = skipDNSName(bytes, rdataOffset);
+  if (pos < 0 || pos >= rdEnd) return -1;
+  pos = skipDNSName(bytes, pos);
+  if (pos < 0 || pos + 20 > rdEnd) return -1;
+  return rdEnd - 4;
+}
+
+function readUint32(bytes, offset) {
+  return (((bytes[offset] * 0x100 + bytes[offset + 1]) * 0x100 + bytes[offset + 2]) * 0x100 + bytes[offset + 3]) >>> 0;
+}
+
+function patchDNSResponseForAge(responseBuffer, queryID, ageSeconds) {
+  const bytes = new Uint8Array(responseBuffer);
+  const copy = new Uint8Array(bytes.length);
+  copy.set(bytes);
+  copy[0] = (queryID >> 8) & 0xff;
+  copy[1] = queryID & 0xff;
+
+  if (copy.length < 12 || ageSeconds <= 0) return copy.buffer;
+
+  const qdcount = (copy[4] << 8) | copy[5];
+  const ancount = (copy[6] << 8) | copy[7];
+  const nscount = (copy[8] << 8) | copy[9];
+  const arcount = (copy[10] << 8) | copy[11];
+
+  let offset = 12;
+  for (let i = 0; i < qdcount; i++) {
+    offset = skipDNSName(copy, offset);
+    if (offset < 0 || offset + 4 > copy.length) return copy.buffer;
+    offset += 4;
+  }
+
+  const counts = [ancount, nscount, arcount];
+  for (const count of counts) {
+    for (let i = 0; i < count; i++) {
+      const rr = readResourceRecord(copy, offset);
+      if (!rr) return copy.buffer;
+      // OPT (TYPE 41) uses its 32-bit field for extended RCODE/version/flags,
+      // not a DNS TTL. Leave it untouched.
+      if (rr.type !== 41) {
+        const remaining = Math.max(0, rr.ttl - ageSeconds);
+        copy[rr.rdataOffset - 6] = (remaining >>> 24) & 0xff;
+        copy[rr.rdataOffset - 5] = (remaining >>> 16) & 0xff;
+        copy[rr.rdataOffset - 4] = (remaining >>> 8) & 0xff;
+        copy[rr.rdataOffset - 3] = remaining & 0xff;
+      }
+      offset = rr.end;
+    }
+  }
+
+  return copy.buffer;
+}
+
+function makeEdgeCacheRequest(origin, key) {
+  return new Request(`${origin}${CONFIG.EDGE_CACHE_PATH}/${key}`, { method: 'GET' });
+}
+
+async function getEdgeCache(key, queryID, origin) {
+  try {
+    const cache = caches.default;
+    const cacheKey = makeEdgeCacheRequest(origin, key);
+    const hit = await cache.match(cacheKey);
+    if (!hit) return null;
+
+    const body = await hit.arrayBuffer();
+    const storedHeader = hit.headers.get('x-doh-stored-at');
+    const ttlHeader = hit.headers.get('x-doh-ttl');
+    const storedAt = Number(storedHeader);
+    const ttlSeconds = Number(ttlHeader);
+
+    if (!Number.isFinite(storedAt) || !Number.isFinite(ttlSeconds) || ttlSeconds <= 0) {
+      return null;
+    }
+
+    const ageSeconds = Math.max(0, Math.floor((Date.now() - storedAt) / 1000));
+    if (ageSeconds >= ttlSeconds) return null;
+
+    return {
+      body,
+      storedAt,
+      ttlSeconds,
+      responseBody: patchDNSResponseForAge(body, queryID, ageSeconds)
+    };
+  } catch (_) {
+    // Cache availability should never break DNS resolution.
+    return null;
+  }
+}
+
+async function putEdgeCache(key, body, ttlSeconds, storedAt, origin) {
+  try {
+    const cache = caches.default;
+    const cacheKey = makeEdgeCacheRequest(origin, key);
+    const response = new Response(body, {
+      status: 200,
+      headers: {
+        'content-type': 'application/dns-message',
+        'cache-control': `public, s-maxage=${Math.max(1, Math.floor(ttlSeconds))}`,
+        'x-doh-stored-at': String(storedAt),
+        'x-doh-ttl': String(Math.max(1, Math.floor(ttlSeconds)))
+      }
+    });
+    await cache.put(cacheKey, response);
+  } catch (_) {
+    // L1 cache and upstream failover remain fully functional if L2 is unavailable.
+  }
 }
 
 async function allowDNSRequest(ip, env) {
@@ -726,13 +1050,20 @@ function getHealthSnapshot() {
       lastError: node.lastError
     })),
     cacheEntries: APP_STATE.cache.size,
+    inflightEntries: APP_STATE.inflight.size,
     throttleEntries: APP_STATE.throttle.size,
     rateLimit: {
       maxRequests: CONFIG.RATE_LIMIT_MAX_REQUESTS,
       windowSeconds: CONFIG.RATE_LIMIT_WINDOW_MS / 1000,
       preferredBinding: 'DNS_RATE_LIMITER'
     },
-    maxSimultaneousUpstreams: 3
+    maxSimultaneousUpstreams: 3,
+    cache: {
+      l1: 'in-memory LRU',
+      l2: CONFIG.EDGE_CACHE_ENABLED ? 'Cloudflare Cache API (data-center-local)' : 'disabled',
+      localMaxTTLSeconds: CONFIG.LOCAL_CACHE_MAX_TTL_SECONDS,
+      edgeMaxTTLSeconds: CONFIG.EDGE_CACHE_MAX_TTL_SECONDS
+    }
   };
 }
 
@@ -742,6 +1073,7 @@ function dnsResponse(body, extraHeaders = {}) {
     headers: {
       'content-type': 'application/dns-message',
       'cache-control': 'no-store',
+      'vary': 'Accept-Encoding',
       ...extraHeaders
     }
   });

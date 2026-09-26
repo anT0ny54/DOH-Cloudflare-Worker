@@ -1,6 +1,11 @@
-# 🛡️ DoH — Cloudflare Worker
+# 🛡️ DoH — Cloudflare Worker v2.5
 
-A lightweight Cloudflare Worker that exposes a standard **DNS-over-HTTPS** endpoint and uses three HaGeZi resolvers with intelligent staged failover:
+A lightweight Cloudflare Worker that exposes a standard **DNS-over-HTTPS** endpoint, uses three HaGeZi resolvers with intelligent staged failover, and keeps a two-level DNS cache:
+
+```txt
+L1: per-isolate memory cache
+L2: Cloudflare Cache API (data-center-local)
+```
 
 ```txt
 https://root.hagezi.org/dns-query
@@ -13,11 +18,36 @@ No other DNS upstreams or resolver profiles are used.
 
 ### Cloudflare limits and how this build uses them
 
-Cloudflare's current Workers Free limits are 100,000 inbound requests/day, 10 ms CPU time/invocation, 128 MB memory, 50 subrequests/invocation, 6 simultaneous outgoing connections/invocation, and 100 MB maximum request body size on the Free plan. The daily 100,000-request limit is an account-level platform limit and cannot be raised by Worker code. See the Cloudflare Workers Limits documentation.
+Cloudflare's current Workers Free limits are 100,000 requests/day, 10 ms CPU time/invocation, 128 MB memory, 50 subrequests/invocation, and 6 simultaneous outgoing connections per invocation. Free requests reset at midnight UTC. Cache API calls are also counted against the subrequest quota, with 50 Cache API calls/request on Free. See the Cloudflare Workers Limits documentation.
 
-This Worker intentionally uses at most **3 DNS upstream subrequests** for a single cache miss and normally uses **1**, so it is far below the 50-subrequest and 6-simultaneous-connection ceilings. Cache hits use **0** upstream subrequests.
+This Worker deliberately stays far below those ceilings on ordinary DNS traffic:
 
-The native Rate Limiting API is designed for low-latency enforcement. Its counters are local to the Cloudflare location and are eventually consistent.
+| Path | Cache API | HaGeZi upstreams |
+|---|---:|---:|
+| L1 cache hit | 0 | 0 |
+| L2 cache hit | 1 | 0 |
+| Cold cache miss | 1 match + 1 async put | normally 1 |
+| Slow/failing recovery | 1 match + 1 async put | at most 3 |
+
+The resolver logic never launches all three upstreams immediately. It starts with one learned/rotated HaGeZi endpoint, hedges to a backup only when latency or failure justifies it, and uses the third endpoint only as last-resort recovery. Maximum concurrent upstream connections from this Worker are therefore 3, below Cloudflare's limit of 6.
+
+### Two-level DNS cache
+
+The Worker intentionally does **not** enable the global Workers Cache feature in `wrangler.toml`. That feature can return a cached response without executing the Worker, which would put the cache in front of the `/dns-query` rate limiter. Instead, the Worker uses the Cache API after rate limiting, so every `/dns-query` request still reaches the rate-limit check.
+
+The Cache API is data-center-local and does not replicate entries automatically between data centers. That is still useful for hot DNS traffic because repeated queries at the same edge location can avoid an upstream lookup entirely.
+
+Both DoH GET and POST requests use the SHA-256-derived DNS wire-query key, with only the transaction ID normalized. Therefore the same DNS question can share a cache entry across GET and POST.
+
+Responses cached internally use DNS TTL-derived expiration. The response transaction ID is rewritten for each client, and cached DNS record TTLs are reduced by cache age before being returned. `Cache-Control: no-store` remains on the client-facing response so the Worker controls the DNS cache instead of creating an uncontrolled browser/HTTP cache layer.
+
+### Rate limiting
+
+`/dns-query` is limited to **100 requests per 60 seconds per client IP** through the native `DNS_RATE_LIMITER` binding in `wrangler.toml`. A lightweight per-isolate fallback remains available when the binding is missing. Cloudflare documents the native Rate Limiting API as low-latency; its counters are scoped to the relevant Cloudflare location rather than being one globally exact counter.
+
+### Request-size protection
+
+DoH DNS messages are normally tiny, so this Worker rejects messages larger than 4 KiB. It checks `Content-Length` before reading a POST when available and also stream-limits chunked/unknown-length bodies. This is intentionally much lower than Cloudflare's platform-level 100 MB Free-plan request-body limit and avoids spending memory/CPU on oversized abuse traffic.
 
 ## Deploy with Wrangler
 
@@ -75,13 +105,14 @@ Content-Type: application/dns-message
 Useful response headers include:
 
 ```txt
-x-cache: HIT / MISS
-x-upstreams: 1 / 2 / 3
+x-cache: L1-HIT / L2-HIT / COALESCED / MISS
+x-edge-cache: HIT / MISS / SKIP
+x-upstreams: 0 / 1 / 2 / 3
 x-winner: <haGeZi-upstream-url>
 x-winner-lat: <latency>
 ```
 
-The `/health` endpoint reports the three resolver scores and basic Worker state.
+The `/health` endpoint reports the three resolver scores plus L1/L2 cache and in-flight state.
 
 ## Important limitation
 

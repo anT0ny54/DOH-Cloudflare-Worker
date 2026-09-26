@@ -1,4 +1,4 @@
-# 🛡️ DoH — Cloudflare Worker v2.5
+# 🛡️ DoH — Cloudflare Worker
 
 A lightweight Cloudflare Worker that exposes a standard **DNS-over-HTTPS** endpoint, uses three HaGeZi resolvers with intelligent staged failover, and keeps a two-level DNS cache:
 

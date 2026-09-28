@@ -1,7 +1,8 @@
-name = "dns"
+name = "secure-doh-worker"
 main = "Worker.js"
 compatibility_date = "2026-09-26"
 
+# Keep this namespace unique when rate-limit counter isolation matters.
 [[ratelimits]]
 name = "DNS_RATE_LIMITER"
 namespace_id = "1001"

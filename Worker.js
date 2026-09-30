@@ -1,10 +1,10 @@
 /**
- * VERSION: 0.2.1
+ * VERSION: 0.2.2
  * GITHUB: https://github.com/anT0ny54/DOH-Cloudflare-Worker
  * Runtime: Cloudflare Workers Module Syntax
  */
 
-const VERSION = '0.2.1';
+const VERSION = '0.2.2';
 
 const CONFIG = {
   DNS_PATH: '/dns-query',
@@ -16,10 +16,14 @@ const CONFIG = {
   EDGE_CACHE_ENABLED: true,
   EDGE_CACHE_PATH: '/__doh-cache/v1',
   LOCAL_CACHE_MAX_TTL_SECONDS: 300,
-  EDGE_CACHE_MAX_TTL_SECONDS: 3600,
+  // Honor long authoritative DNS TTLs in L2 so hot names do not needlessly
+  // re-resolve every hour. Correctness is still bounded by the DNS TTL.
+  EDGE_CACHE_MAX_TTL_SECONDS: 86_400,
   EDGE_CACHE_MIN_TTL_SECONDS: 1,
   MAX_CACHE_ENTRIES: 512,
-  MAX_INFLIGHT_ENTRIES: 256,
+  // Bound duplicate-resolution state without allowing an attacker to retain
+  // hundreds of large promise/result objects during a burst.
+  MAX_INFLIGHT_ENTRIES: 128,
 
   // Preferred: Cloudflare's native Rate Limiting binding (100/60s per IP).
   // Fallback: lightweight per-isolate fixed-window limiter when the binding is
@@ -35,10 +39,10 @@ const CONFIG = {
   MAX_GET_DNS_CHARS: 5462,
   // Upstream DoH responses may legitimately be larger than client queries, but
   // they must still be bounded before being buffered by the Worker.
-  MAX_UPSTREAM_DNS_MESSAGE_BYTES: 262_144,
+  MAX_UPSTREAM_DNS_MESSAGE_BYTES: 65_535,
   // A DNS message cannot exceed 64 KiB, so anything larger is never cached.
-  // This also bounds worst-case L1 memory (MAX_CACHE_ENTRIES x 64 KiB) well
-  // below the 128 MB isolate limit.
+  // Keep the upstream buffer at the DNS wire-format maximum as well, avoiding
+  // a needlessly large per-request memory ceiling on the 128 MB isolate.
   MAX_CACHEABLE_DNS_BYTES: 65_535,
 
   // Intelligent hedging: start with one resolver, then add a backup only when

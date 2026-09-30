@@ -29,7 +29,7 @@ This Worker deliberately stays far below those ceilings on ordinary DNS traffic:
 | Cold cache miss | 1 match + 1 async put | normally 1 |
 | Slow/failing recovery | 1 match + 1 async put | at most 3 |
 
-The resolver logic never launches all three upstreams immediately. It starts with one learned/rotated HaGeZi endpoint, hedges to a backup only when latency or failure justifies it, and uses the third endpoint only as last-resort recovery. Maximum concurrent upstream connections from this Worker are therefore 3, below Cloudflare's limit of 6.
+The resolver logic never launches all three upstreams immediately. In-flight duplicate work is bounded at 128 entries, and upstream response buffering is capped at 65,535 bytes to reduce worst-case memory pressure. It starts with one learned/rotated HaGeZi endpoint, hedges to a backup only when latency or failure justifies it, and uses the third endpoint only as last-resort recovery. Maximum concurrent upstream connections from this Worker are therefore 3, below Cloudflare's limit of 6.
 
 ### Two-level DNS cache
 
@@ -49,7 +49,7 @@ Responses cached internally use DNS TTL-derived expiration. The response transac
 
 ### Request-size protection
 
-DoH DNS messages are normally tiny, so this Worker rejects client messages larger than 4 KiB. It checks `Content-Length` before reading a POST when available and also stream-limits chunked/unknown-length bodies. Upstream resolver responses are independently capped at **256 KiB** and are stream-limited before buffering. These limits avoid spending memory/CPU on oversized abuse traffic while still allowing large legitimate DNSSEC/EDNS answers.
+DoH DNS messages are normally tiny, so this Worker rejects client messages larger than 4 KiB. It checks `Content-Length` before reading a POST when available and also stream-limits chunked/unknown-length bodies. Upstream resolver responses are independently capped at **65,535 bytes** (the DNS wire-format maximum) and are stream-limited before buffering. These limits avoid spending memory/CPU on oversized abuse traffic while still allowing large legitimate DNSSEC/EDNS answers.
 
 ## Deploy with Wrangler
 
@@ -91,7 +91,7 @@ Content-Type: application/dns-message
 
 ## Cloudflare Worker notes
 
-The L1 cache is a per-isolate LRU (512 entries, TTL capped at 300 s). Correctness never depends on the Cache API: if L2 is unavailable, misses, or fails, requests fall through to the upstream resolvers. Expired isolate-local cache and throttle entries are swept periodically so `/health` does not retain stale bounded state indefinitely.
+The L1 cache is a per-isolate LRU (512 entries, TTL capped at 300 s). L2 Cache API entries can honor authoritative TTLs up to 24 hours, reducing unnecessary upstream resolutions for long-lived DNS records. Correctness never depends on the Cache API: if L2 is unavailable, misses, or fails, requests fall through to the upstream resolvers. Expired isolate-local cache and throttle entries are swept periodically so `/health` does not retain stale bounded state indefinitely.
 
 For a production deployment, attach the Worker to a custom domain and use:
 

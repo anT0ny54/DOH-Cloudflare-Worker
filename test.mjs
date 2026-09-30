@@ -174,7 +174,7 @@ test('health endpoint returns current hardening configuration', async () => {
   const res = await worker.fetch(req, {}, {});
   assert.equal(res.status, 200);
   const body = await res.json();
-  assert.equal(body.maxUpstreamDNSMessageBytes, 262144);
+  assert.equal(body.maxUpstreamDNSMessageBytes, 65535);
   assert.equal(body.rateLimit.invalidBindingFallback, 'per-isolate local limiter');
   assert.equal(body.maxSimultaneousUpstreams, 3);
 });
@@ -349,7 +349,7 @@ test('coalesced degraded results propagate x-dns-degraded', async () => {
 test('health reports version and sweep interval', async () => {
   const res = await worker.fetch(new Request('https://workers.example/health'), {}, {});
   const body = await res.json();
-  assert.equal(body.version, '0.2.1');
+  assert.equal(body.version, '0.2.2');
   assert.equal(body.stateSweepIntervalSeconds, 60);
 });
 

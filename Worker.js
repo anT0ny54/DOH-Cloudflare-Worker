@@ -1,10 +1,10 @@
 /**
- * VERSION: 0.2.2
+ * VERSION: 0.2.3
  * GITHUB: https://github.com/anT0ny54/DOH-Cloudflare-Worker
  * Runtime: Cloudflare Workers Module Syntax
  */
 
-const VERSION = '0.2.2';
+const VERSION = '0.2.3';
 
 const CONFIG = {
   DNS_PATH: '/dns-query',
@@ -165,17 +165,22 @@ async function handleDNS(req, url, ctx) {
   // This prevents a burst of identical cold queries from multiplying upstream
   // traffic before the first response has reached either cache.
   const existing = APP_STATE.inflight.get(cacheKey);
-  if (existing) {
-    const shared = await awaitSharedResolution(existing);
-    return coalescedDNSResponse(shared, parsed, payload);
-  }
+  if (existing) return awaitCoalesced(existing, parsed, payload);
 
   // L2: Cache API. This runs after the rate limiter, so enabling this cache
   // does not bypass the per-IP /dns-query protection.
   if (CONFIG.EDGE_CACHE_ENABLED) {
     const edgeHit = await getEdgeCache(cacheKey, parsed.id, url.origin, payload);
     if (edgeHit) {
-      setCache(cacheKey, edgeHit.body, Math.min(edgeHit.ttlSeconds, CONFIG.LOCAL_CACHE_MAX_TTL_SECONDS), edgeHit.storedAt);
+      // Bound L1 by the *remaining* TTL measured from now. Measuring from
+      // storedAt made entries older than the L1 cap expire instantly, so hot
+      // long-TTL names never reached L1 and cost a Cache API call every time.
+      setCache(
+        cacheKey,
+        edgeHit.body,
+        Math.min(edgeHit.remainingSeconds, CONFIG.LOCAL_CACHE_MAX_TTL_SECONDS),
+        edgeHit.storedAt
+      );
       return dnsResponse(edgeHit.responseBody, {
         'x-cache': 'L2-HIT',
         'x-edge-cache': 'HIT',
@@ -187,10 +192,7 @@ async function handleDNS(req, url, ctx) {
   // A second in-flight check closes the race between the L2 lookup and creating
   // a new upstream job.
   const raced = APP_STATE.inflight.get(cacheKey);
-  if (raced) {
-    const shared = await awaitSharedResolution(raced);
-    return coalescedDNSResponse(shared, parsed, payload);
-  }
+  if (raced) return awaitCoalesced(raced, parsed, payload);
 
   const resolvers = selectRacers(RESOLVER_NODES);
   const job = (async () => {
@@ -256,19 +258,15 @@ async function handleDNS(req, url, ctx) {
   }
 }
 
-async function awaitSharedResolution(job) {
+async function awaitCoalesced(job, parsed, queryBytes) {
+  // Followers must turn a failed shared job into the same controlled 502 the
+  // leader returns; letting the rejection escape would surface as a Worker
+  // exception (HTTP 500 / error 1101) for every coalesced request.
   try {
-    return await job;
+    return coalescedDNSResponse(await job, parsed, queryBytes);
   } catch (err) {
-    throw toUpstreamFailure(err);
+    return upstreamFailureResponse(err);
   }
-}
-
-function toUpstreamFailure(err) {
-  const failure = new Error('Global resolving failed');
-  failure.status = 502;
-  failure.attempts = err?.attempts || 0;
-  return failure;
 }
 
 function upstreamFailureResponse(err, fallbackAttempts = 0) {
@@ -797,12 +795,14 @@ function getCache(key) {
 
 function setCache(key, body, ttlSeconds, storedAt = Date.now()) {
   const ttl = Math.max(1, Math.floor(ttlSeconds));
+  // storedAt drives the TTL age patch on hits; expiry is measured from now so
+  // entries promoted from L2 keep their full remaining (capped) lifetime.
   // Delete first so re-inserted keys move to the newest LRU position.
   APP_STATE.cache.delete(key);
   APP_STATE.cache.set(key, {
     body,
     storedAt,
-    expiresAt: storedAt + ttl * 1000
+    expiresAt: Date.now() + ttl * 1000
   });
 
   trimMap(APP_STATE.cache, CONFIG.MAX_CACHE_ENTRIES);
@@ -848,7 +848,7 @@ function getDNSCacheTTL(responseBuffer) {
     for (let i = 0; i < count; i++) {
       const rr = readResourceRecord(bytes, offset);
       if (!rr) return 0;
-      offset = rr.end;
+      offset = rr.rdEnd;
 
       // OPT and other meta records are not useful DNS answer TTLs here.
       if (rr.type === 41) continue;
@@ -926,8 +926,7 @@ function readResourceRecord(bytes, offset) {
     ttl,
     rdLength,
     rdataOffset,
-    rdEnd,
-    end: rdEnd
+    rdEnd
   };
 }
 
@@ -1001,7 +1000,7 @@ function patchDNSResponseForAge(responseBuffer, queryID, ageSeconds, queryBytes)
         copy[rr.rdataOffset - 4] = (remaining >>> 8) & 0xff;
         copy[rr.rdataOffset - 3] = remaining & 0xff;
       }
-      offset = rr.end;
+      offset = rr.rdEnd;
     }
   }
 
@@ -1036,6 +1035,7 @@ async function getEdgeCache(key, queryID, origin, queryBytes) {
       body,
       storedAt,
       ttlSeconds,
+      remainingSeconds: ttlSeconds - ageSeconds,
       responseBody: patchDNSResponseForAge(body, queryID, ageSeconds, queryBytes)
     };
   } catch (_) {

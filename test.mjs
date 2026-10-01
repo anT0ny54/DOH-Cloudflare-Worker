@@ -349,7 +349,7 @@ test('coalesced degraded results propagate x-dns-degraded', async () => {
 test('health reports version and sweep interval', async () => {
   const res = await worker.fetch(new Request('https://workers.example/health'), {}, {});
   const body = await res.json();
-  assert.equal(body.version, '0.2.2');
+  assert.equal(body.version, '0.2.3');
   assert.equal(body.stateSweepIntervalSeconds, 60);
 });
 
@@ -484,5 +484,53 @@ test('SERVFAIL is not force-cached in L1', async () => {
       });
     },
     caches: cacheMock()
+  });
+});
+
+test('requests joining a failed in-flight resolution get a 502, not an exception', async () => {
+  let releaseUpstream;
+  const gate = new Promise((resolve) => { releaseUpstream = resolve; });
+
+  await withGlobalRuntimeMocks(async () => {
+    const first = postQuery('joinfail.example', 'join-fail');
+    await new Promise((resolve) => setImmediate(resolve));
+    const second = postQuery('joinfail.example', 'join-fail');
+    await new Promise((resolve) => setImmediate(resolve));
+    releaseUpstream();
+
+    const results = await Promise.allSettled([first, second]);
+    for (const r of results) {
+      assert.equal(r.status, 'fulfilled');
+      assert.equal(r.value.status, 502);
+    }
+  }, {
+    fetch: async () => { await gate; throw new Error('upstream down'); },
+    caches: cacheMock()
+  });
+});
+
+test('L2 hit older than the L1 cap is still promoted to L1', async () => {
+  const query = makeQuery('promote.example');
+  const key = await __internals.makeCacheKey(query);
+  const body = __internals.normalizeDNSResponseID(makeAResponse(query, 3600).buffer);
+  const storedAt = Date.now() - 400_000; // older than LOCAL_CACHE_MAX_TTL_SECONDS (300 s)
+
+  await withGlobalRuntimeMocks(async () => {
+    const first = await postQuery('promote.example', 'promote-test');
+    assert.equal(first.headers.get('x-cache'), 'L2-HIT');
+    const second = await postQuery('promote.example', 'promote-test');
+    assert.equal(second.headers.get('x-cache'), 'L1-HIT');
+  }, {
+    fetch: async () => { throw new Error('upstream must not be used'); },
+    caches: {
+      default: {
+        match: async (req) => (req.url.endsWith(key)
+          ? new Response(body, {
+            headers: { 'x-doh-stored-at': String(storedAt), 'x-doh-ttl': '3600' }
+          })
+          : null),
+        put: async () => {}
+      }
+    }
   });
 });

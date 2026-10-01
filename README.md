@@ -26,8 +26,8 @@ This Worker deliberately stays far below those ceilings on ordinary DNS traffic:
 |---|---:|---:|
 | L1 cache hit | 0 | 0 |
 | L2 cache hit | 1 | 0 |
-| Cold cache miss | 1 match + 1 async put | normally 1 |
-| Slow/failing recovery | 1 match + 1 async put | at most 3 |
+| Cold cache miss | 1 match + 1 async put (only if the answer is cacheable) | normally 1 |
+| Slow/failing recovery | 1 match + 1 async put (only if the answer is cacheable) | at most 3 |
 
 The resolver logic never launches all three upstreams immediately. In-flight duplicate work is bounded at 128 entries, and upstream response buffering is capped at 65,535 bytes to reduce worst-case memory pressure. It starts with one learned/rotated HaGeZi endpoint, hedges to a backup only when latency or failure justifies it, and uses the third endpoint only as last-resort recovery. Maximum concurrent upstream connections from this Worker are therefore 3, below Cloudflare's limit of 6.
 
@@ -39,7 +39,7 @@ The Cache API is data-center-local and does not replicate entries automatically 
 
 Both DoH GET and POST requests use the SHA-256-derived DNS wire-query key, with only the transaction ID normalized. ASCII QNAME case is also normalized when the question name is uncompressed, so `example.com`, `EXAMPLE.com`, and mixed-case variants can share a cache entry. Therefore the same DNS question can share a cache entry across GET and POST. When a cached answer is served, the question section is rewritten to the exact letter case the requesting client sent, so DNS 0x20-style case randomization still validates.
 
-Only DNS answers that are safe to reuse are cached: `NOERROR` and `NXDOMAIN` responses that are not truncated (TC) and are at most 65,535 bytes. Negative answers (`NXDOMAIN`/`NODATA`) are cached only when they carry an SOA record, using `min(SOA TTL, SOA MINIMUM)` per RFC 2308. `SERVFAIL`, `REFUSED` and similar responses are relayed to the client (marked `x-dns-degraded: 1`) but never cached.
+Only DNS answers that are safe to reuse are cached: `NOERROR` and `NXDOMAIN` responses that are not truncated (TC) and are at most 65,535 bytes. Negative answers (`NXDOMAIN`/`NODATA`) are cached only when they carry an SOA record; the TTL is the smaller of the lowest authority-section record TTL (which includes the SOA TTL) and the SOA `MINIMUM` field, per RFC 2308. `SERVFAIL`, `REFUSED` and similar responses are relayed to the client (marked `x-dns-degraded: 1`) but never cached.
 
 Responses cached internally use DNS TTL-derived expiration. The response transaction ID is rewritten for each client, and cached DNS record TTLs are reduced by cache age before being returned. `Cache-Control: no-store` remains on the client-facing response so the Worker controls the DNS cache instead of creating an uncontrolled browser/HTTP cache layer.
 
@@ -69,7 +69,14 @@ After deployment:
 https://YOUR-DOMAIN.example/dns-query
 ```
 
-The Worker also serves a small dashboard at `/`.
+| Path | Purpose |
+|---|---|
+| `/dns-query` | DoH endpoint (GET and POST), rate limited |
+| `/health` | JSON status: version, resolver scores, cache/in-flight/throttle counters, limits |
+| `/`, `/index.html` | Setup dashboard (EN / FA / ZH). It loads the Tailwind Play CDN script from `cdn.tailwindcss.com`; the DoH endpoint itself does not depend on it |
+| anything else | `404` |
+
+`/dns-query` status codes: `200` DNS message, `400` malformed query or missing `dns` parameter, `405` method other than GET/POST, `413` message larger than 4 KiB, `415` POST without `application/dns-message`, `429` rate limit exceeded (`Retry-After: 60`), `502` all upstreams failed.
 
 ## DoH methods
 
@@ -91,7 +98,7 @@ Content-Type: application/dns-message
 
 ## Cloudflare Worker notes
 
-The L1 cache is a per-isolate LRU (512 entries, TTL capped at 300 s). L2 Cache API entries can honor authoritative TTLs up to 24 hours, reducing unnecessary upstream resolutions for long-lived DNS records. Correctness never depends on the Cache API: if L2 is unavailable, misses, or fails, requests fall through to the upstream resolvers. Expired isolate-local cache and throttle entries are swept periodically so `/health` does not retain stale bounded state indefinitely.
+The L1 cache is a per-isolate LRU (512 entries, lifetime capped at 300 s or the record's remaining TTL, whichever is shorter). Entries found in L2 are promoted to L1 using their *remaining* TTL, so hot long-TTL names are served from memory even when the L2 entry is older than 300 s. Identical concurrent cache misses within one isolate share a single upstream resolution; if that resolution fails, every waiting request receives the same `502`. L2 Cache API entries can honor authoritative TTLs up to 24 hours, reducing unnecessary upstream resolutions for long-lived DNS records. Correctness never depends on the Cache API: if L2 is unavailable, misses, or fails, requests fall through to the upstream resolvers. Expired isolate-local cache and throttle entries are swept periodically so `/health` does not retain stale bounded state indefinitely.
 
 For a production deployment, attach the Worker to a custom domain and use:
 
@@ -120,14 +127,14 @@ Useful response headers include:
 
 ```txt
 x-cache: L1-HIT / L2-HIT / COALESCED / MISS
-x-edge-cache: HIT / MISS / SKIP
+x-edge-cache: HIT / MISS / SKIP / DISABLED
 x-upstreams: 0 / 1 / 2 / 3
-x-winner: <haGeZi-upstream-url>
-x-winner-lat: <latency>
+x-winner: <haGeZi-upstream-url>      (MISS and COALESCED only)
+x-winner-lat: <latency>               (MISS and COALESCED only)
 x-dns-degraded: 1   (only when the answer is SERVFAIL/REFUSED/etc.)
 ```
 
-The `/health` endpoint reports the three resolver scores plus L1/L2 cache and in-flight state.
+The `/health` endpoint reports the Worker version, the three resolver scores, and L1/L2 cache, in-flight and rate-limit state. The test suite (30 tests) mocks `fetch` and the Cache API, so it needs no network or Cloudflare account.
 
 
 ## Important limitation

@@ -349,7 +349,7 @@ test('coalesced degraded results propagate x-dns-degraded', async () => {
 test('health reports version and sweep interval', async () => {
   const res = await worker.fetch(new Request('https://workers.example/health'), {}, {});
   const body = await res.json();
-  assert.equal(body.version, '0.2.3');
+  assert.equal(body.version, '0.2.4');
   assert.equal(body.stateSweepIntervalSeconds, 60);
 });
 
@@ -533,4 +533,51 @@ test('L2 hit older than the L1 cap is still promoted to L1', async () => {
       }
     }
   });
+});
+
+
+test('getDNSCacheTTL treats TTLs with the MSB set as zero (RFC 2181)', () => {
+  const response = makeAResponse(makeQuery('hugettl.example'), 0x80000000);
+  assert.equal(__internals.getDNSCacheTTL(response), 0);
+});
+
+test('getDNSCacheTTL clamps long TTLs to the L2 maximum', () => {
+  const response = makeAResponse(makeQuery('longttl.example'), 0x7fffffff);
+  assert.equal(__internals.getDNSCacheTTL(response), __internals.CONFIG.EDGE_CACHE_MAX_TTL_SECONDS);
+});
+
+test('hedge delays stay inside their configured bounds', () => {
+  const { CONFIG, getHedgeDelay, getSecondaryHedgeDelay } = __internals;
+  assert.equal(getHedgeDelay({ ewmaLatencyMs: 1 }), CONFIG.HEDGE_MIN_MS);
+  assert.equal(getHedgeDelay({ ewmaLatencyMs: 10_000 }), CONFIG.HEDGE_MAX_MS);
+  assert.equal(getHedgeDelay({ ewmaLatencyMs: null }), 180); // 120 ms default * 1.5
+  assert.equal(getSecondaryHedgeDelay(), CONFIG.SECONDARY_HEDGE_MS);
+});
+
+test('selectRacers puts the healthiest resolver first and keeps all three', () => {
+  const mk = (order, score, ewmaLatencyMs = null) => ({ url: `u${order}`, order, score, ewmaLatencyMs });
+  const racers = __internals.selectRacers([mk(0, 40), mk(1, 100, 50), mk(2, 70)]);
+  assert.equal(racers.length, 3);
+  assert.equal(racers[0].order, 1); // only node within 8 points of the best score
+  assert.deepEqual(racers.map((n) => n.order).sort(), [0, 1, 2]);
+});
+
+test('localRateLimit allows 100 requests per window then blocks', () => {
+  const ip = 'local-limit-unit-test';
+  for (let i = 0; i < __internals.CONFIG.RATE_LIMIT_MAX_REQUESTS; i++) {
+    assert.equal(__internals.localRateLimit(ip), true);
+  }
+  assert.equal(__internals.localRateLimit(ip), false);
+});
+
+test('localRateLimit keeps a busy client when new keys flood the table', () => {
+  const busy = 'lru-busy-client';
+  for (let i = 0; i < 99; i++) __internals.localRateLimit(busy);
+  const max = __internals.CONFIG.MAX_THROTTLE_ENTRIES;
+  for (let i = 0; i < max + 10; i++) {
+    __internals.localRateLimit(`lru-filler-${i}`);
+    if (i % 500 === 0) __internals.localRateLimit(busy); // stays recently used
+  }
+  // 99 + several refreshes exceed the limit, so the counter must survive eviction.
+  assert.equal(__internals.localRateLimit(busy), false);
 });

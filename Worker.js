@@ -1,10 +1,10 @@
 /**
- * VERSION: 0.2.3
+ * VERSION: 0.2.4
  * GITHUB: https://github.com/anT0ny54/DOH-Cloudflare-Worker
  * Runtime: Cloudflare Workers Module Syntax
  */
 
-const VERSION = '0.2.3';
+const VERSION = '0.2.4';
 
 const CONFIG = {
   DNS_PATH: '/dns-query',
@@ -51,8 +51,7 @@ const CONFIG = {
   UPSTREAM_TIMEOUT_MS: 1200,
   HEDGE_MIN_MS: 80,
   HEDGE_MAX_MS: 220,
-  SECONDARY_HEDGE_MIN_MS: 120,
-  SECONDARY_HEDGE_MAX_MS: 260,
+  SECONDARY_HEDGE_MS: 150,
 
   SCORE_START: 100,
   SCORE_MIN: 0,
@@ -134,12 +133,9 @@ async function handleDNS(req, url, ctx) {
     });
   }
 
-  if (!payload || payload.byteLength === 0) {
+  // readDNSPayload already enforces MAX_DNS_MESSAGE_BYTES for GET and POST.
+  if (payload.byteLength === 0) {
     return textResponse('Empty DNS query', 400, { 'cache-control': 'no-store' });
-  }
-
-  if (payload.byteLength > CONFIG.MAX_DNS_MESSAGE_BYTES) {
-    return textResponse('DNS message too large', 413, { 'cache-control': 'no-store' });
   }
 
   const parsed = parseDNSQuestion(payload);
@@ -218,7 +214,7 @@ async function handleDNS(req, url, ctx) {
           ctx?.waitUntil?.(putEdgeCache(
             cacheKey,
             normalizedBody,
-            Math.min(ttlSeconds, CONFIG.EDGE_CACHE_MAX_TTL_SECONDS),
+            ttlSeconds, // already clamped to EDGE_CACHE_MAX_TTL_SECONDS
             storedAt,
             url.origin
           ));
@@ -599,7 +595,7 @@ function getHedgeDelay(node) {
 }
 
 function getSecondaryHedgeDelay() {
-  return clamp(150, CONFIG.SECONDARY_HEDGE_MIN_MS, CONFIG.SECONDARY_HEDGE_MAX_MS);
+  return CONFIG.SECONDARY_HEDGE_MS;
 }
 
 async function relay(node, packet, expectedID, signal) {
@@ -886,7 +882,6 @@ function getDNSCacheTTL(responseBuffer) {
 
 function skipDNSName(bytes, offset) {
   let pos = offset;
-  let jumps = 0;
   let wireLength = 1; // Root terminator.
 
   while (pos < bytes.length) {
@@ -903,8 +898,8 @@ function skipDNSName(bytes, offset) {
     wireLength += len + 1;
     if (wireLength > 255) return -1;
 
+    // wireLength <= 255 already bounds the label count (max 127).
     pos += 1 + len;
-    if (++jumps > 127) return -1;
   }
 
   return -1;
@@ -915,7 +910,8 @@ function readResourceRecord(bytes, offset) {
   if (nameEnd < 0 || nameEnd + 10 > bytes.length) return null;
 
   const type = (bytes[nameEnd] << 8) | bytes[nameEnd + 1];
-  const ttl = readUint32(bytes, nameEnd + 4);
+  let ttl = readUint32(bytes, nameEnd + 4);
+  if (ttl > 0x7fffffff) ttl = 0; // RFC 2181 section 8: MSB set -> treat as zero.
   const rdLength = (bytes[nameEnd + 8] << 8) | bytes[nameEnd + 9];
   const rdataOffset = nameEnd + 10;
   const rdEnd = rdataOffset + rdLength;
@@ -1104,6 +1100,9 @@ function localRateLimit(ip) {
   }
 
   stats.count += 1;
+  // Delete first so active clients move to the newest position; otherwise a
+  // flood of new keys would evict (and reset) the busiest client first.
+  APP_STATE.throttle.delete(ip);
   APP_STATE.throttle.set(ip, stats);
 
   trimMap(APP_STATE.throttle, CONFIG.MAX_THROTTLE_ENTRIES);
@@ -1292,35 +1291,33 @@ function renderUI(host) {
             <section id="docPanels" class="min-h-[300px]">
                 <!-- Chrome/Edge Panel -->
                 <div id="chrome" class="panel panel-active cyber-glass p-10 md:p-14 rounded-[3rem]">
-                    <h3 class="text-2xl font-black mb-8 text-cyan-100" id="cH">Setup for Chromium Browsers</h3>
-                    <div class="space-y-6 text-slate-400 text-sm leading-relaxed" id="cL">
-                        <p>1. Open Browser <b>Settings</b> and type "DNS" in the search box.</p>
-                        <p>2. Select <b>Security</b> > Scroll to <b>Use Secure DNS</b>.</p>
-                        <p>3. Choose <b>"With Custom"</b> provider.</p>
-                        <p>4. Paste your DoH endpoint URL from the copy-box above.</p>
-                        <p>5. Test by visiting a DNS-restricted website.</p>
-                    </div>
+                    <h3 class="text-2xl font-black mb-8 text-cyan-100" id="cH">Chromium Browser Settings</h3>
+                    <ul class="list-none space-y-6 text-slate-400 text-sm leading-relaxed" id="cL">
+                        <li>1. Open Browser <b>Settings</b> and find <b>Privacy &amp; Security</b>.</li>
+                        <li>2. Scroll to <b>"Use Secure DNS"</b>.</li>
+                        <li>3. Select <b>"With Custom"</b>.</li>
+                        <li>4. Paste your DoH endpoint URL provided above.</li>
+                    </ul>
                 </div>
 
                 <!-- Firefox Panel -->
                 <div id="firefox" class="panel cyber-glass p-10 md:p-14 rounded-[3rem]">
-                    <h3 class="text-2xl font-black mb-8 text-emerald-100" id="fH">Setup for Firefox</h3>
-                    <div class="space-y-6 text-slate-400 text-sm leading-relaxed" id="fL">
-                        <p>1. Open Firefox <code>Settings</code> and scroll down to <b>Network Settings</b>.</p>
-                        <p>2. Click <b>Settings...</b> and check <b>"Enable DNS over HTTPS"</b> at the bottom.</p>
-                        <p>3. Set provider to <b>Custom</b> and paste your unique URL.</p>
-                        <p>4. Select <b>"Max Protection"</b> for stronger browser-level DNS privacy.</p>
-                    </div>
+                    <h3 class="text-2xl font-black mb-8 text-emerald-100" id="fH">Firefox Network Options</h3>
+                    <ul class="list-none space-y-6 text-slate-400 text-sm leading-relaxed" id="fL">
+                        <li>1. In Firefox <code>Settings</code>, search for "DNS over HTTPS".</li>
+                        <li>2. Select <b>Custom</b> from the providers dropdown.</li>
+                        <li>3. Paste this DoH endpoint URL and save.</li>
+                    </ul>
                 </div>
 
                 <!-- Mobile/iOS Panel -->
                 <div id="mobile" class="panel cyber-glass p-10 md:p-14 rounded-[3rem]">
-                    <h3 class="text-2xl font-black mb-8 text-teal-100" id="mH">Android / iOS Logic</h3>
-                    <p class="text-slate-500 text-sm mb-6 italic" id="mD">This resolver is a DoH (HTTPS-based) service, which modern phones handle differently than system-wide settings.</p>
-                    <div class="space-y-6 text-slate-400 text-sm" id="mL">
-                        <p><b>A) For Mobile Browsers:</b> Open Browser settings (Chrome/Firefox/Edge) on your phone and follow the desktop steps. <b>This is the best and fastest way.</b></p>
-                        <p><b>B) For System-wide Apps:</b> We recommend using <b>RethinkDNS</b> or <b>Intra</b> apps. In these apps, set the DNS type to DoH and provide your unique DoH endpoint link.</p>
-                    </div>
+                    <h3 class="text-2xl font-black mb-8 text-teal-100" id="mH">Mobile Setup Strategy</h3>
+                    <p class="text-slate-500 text-sm mb-6 italic" id="mD">Smartphones often prioritize DoT hostnames in system settings. To use this Worker DoH endpoint:</p>
+                    <ul class="list-none space-y-6 text-slate-400 text-sm" id="mL">
+                        <li><b>In Browsers:</b> Setting it directly in Chrome or Firefox for Mobile is the easiest path.</li>
+                        <li><b>For Apps:</b> Use <b>Intra</b> or <b>RethinkDNS</b> apps and set DoH server to this link.</li>
+                    </ul>
                 </div>
             </section>
         </div>
@@ -1328,12 +1325,10 @@ function renderUI(host) {
         <!-- SPECIAL EXPLANATION (Critical Point) -->
         <div class="cyber-glass p-8 md:p-12 rounded-[3.5rem] mb-20 border-sky-900/40 relative">
             <h4 class="text-sky-400 font-black text-base md:text-lg mb-6 flex items-center gap-3">
-                ⭐ <span id="whyH">Why ONLY Browser-level DOH? (Crucial Tip)</span>
+                ⭐ <span id="whyH">Why Browser-Level ONLY? (The Technical Reality)</span>
             </h4>
             <div class="space-y-6 text-[13px] md:text-[14px] text-slate-400 leading-loose" id="whyT">
-                <p>Most operating systems (Windows settings, Android "Private DNS", or Apple Profiles) natively expect <b>DNS-over-TLS (DoT)</b> which runs on Port 853. Since this worker is built on <b>Cloudflare Edge (Serverless)</b>, it strictly provides <b>DNS-over-HTTPS (DoH)</b> running on Port 443.</p>
-                <p><b>The Issue:</b> You <u>cannot</u> paste an <code>https://</code> link into many native DNS settings. It will usually result in an "Invalid Hostname" error. Systems there expect a simple domain, but this service requires the full path for HTTPS resolution.</p>
-                <p><b>The Solution:</b> Browsers (Chrome, Edge, Firefox) have their own independent DoH clients. They are compatible with Port 443 workers and provide browser-level encrypted DNS. DoH encrypts DNS queries between your browser and this endpoint, but it does not hide destination IPs or guarantee bypass on every network.</p>
+                <p>Operating systems like Windows/Android often expect <b>DoT (Port 853)</b> or native resolver formats and may not accept a full <code>https://</code> DoH URL. Workers on Cloudflare run on <b>HTTPS (Port 443)</b>.</p><p><b>Result:</b> Modern browsers include their own DoH engine which works well on Port 443. DoH encrypts DNS queries between your browser and this Worker, but it does not hide destination IPs or guarantee bypass on every network.</p>
             </div>
         </div>
 
@@ -1396,6 +1391,7 @@ function renderUI(host) {
             try { localStorage.setItem('doc_v6', c); } catch (_) {}
             const l = I18N[c];
             document.body.classList.toggle('lang-fa', c === 'fa');
+            document.documentElement.lang = c;
             document.getElementById('currentLang').innerText = l.curL;
             document.getElementById('mainTitle').innerText = l.main;
             document.getElementById('subTag').innerText = l.sub;

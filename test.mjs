@@ -210,7 +210,7 @@ test('oversized upstream response with declared length is rejected', async () =>
       status: 200,
       headers: {
         'content-type': 'application/dns-message',
-        'content-length': String(262145)
+        'content-length': String(65536)
       }
     })
   });
@@ -305,7 +305,7 @@ test('coalesced degraded results propagate x-dns-degraded', async () => {
 test('health reports version and sweep interval', async () => {
   const res = await worker.fetch(new Request('https://workers.example/health'), {}, {});
   const body = await res.json();
-  assert.equal(body.version, '0.2.5');
+  assert.equal(body.version, '0.2.8');
   assert.equal(body.stateSweepIntervalSeconds, 60);
 });
 test('DNS name wire length boundary is enforced', () => {
@@ -324,7 +324,7 @@ test('DNS name wire length boundary is enforced', () => {
   assert.equal(__internals.parseDNSQuestion(makeQuery(validName)).ok, true);
   assert.equal(__internals.parseDNSQuestion(makeQuery(invalidName)).ok, false);
 });
-test('valid compressed question name is accepted structurally', () => {
+test('compression pointers in a query question name are rejected', () => {
   const query = makeQuery('example.com');
   const compressed = new Uint8Array([
     ...query.slice(0, 12),
@@ -332,8 +332,37 @@ test('valid compressed question name is accepted structurally', () => {
     0, 1,
     0, 1
   ]);
-  const parsed = __internals.parseDNSQuestion(compressed);
-  assert.equal(parsed.ok, true);
+  assert.equal(__internals.parseDNSQuestion(compressed).ok, false);
+  const trailingPointer = new Uint8Array([
+    ...query.slice(0, 12),
+    3, 119, 119, 119,
+    0xc0, 0x0c,
+    0, 1,
+    0, 1
+  ]);
+  assert.equal(__internals.parseDNSQuestion(trailingPointer).ok, false);
+});
+test('a query with a compressed question name gets 400 and never reaches upstream', async () => {
+  let upstreamCalls = 0;
+  await withGlobalRuntimeMocks(async () => {
+    const query = makeQuery('example.com');
+    const compressed = new Uint8Array([...query.slice(0, 12), 0xc0, 0x0c, 0, 1, 0, 1]);
+    const before = (await (await worker.fetch(new Request('https://workers.example/health'), {}, {})).json())
+      .upstreams.map((u) => u.score);
+    const res = await worker.fetch(new Request('https://workers.example/dns-query', {
+      method: 'POST',
+      headers: { 'content-type': 'application/dns-message', 'cf-connecting-ip': 'pointer-test' },
+      body: compressed
+    }), {}, {});
+    assert.equal(res.status, 400);
+    assert.equal(upstreamCalls, 0);
+    const after = (await (await worker.fetch(new Request('https://workers.example/health'), {}, {})).json())
+      .upstreams.map((u) => u.score);
+    assert.deepEqual(after, before);
+  }, {
+    fetch: async () => { upstreamCalls += 1; throw new Error('upstream must not be used'); },
+    caches: cacheMock()
+  });
 });
 function makeNxdomainWithSOA(query, ttl, minimum) {
   const bytes = Array.from(query);
@@ -439,6 +468,8 @@ test('requests joining a failed in-flight resolution get a 502, not an exception
       assert.equal(r.status, 'fulfilled');
       assert.equal(r.value.status, 502);
     }
+    assert.equal(results[0].value.headers.get('x-upstreams'), '3');
+    assert.equal(results[1].value.headers.get('x-upstreams'), '0');
   }, {
     fetch: async () => { await gate; throw new Error('upstream down'); },
     caches: cacheMock()
@@ -505,4 +536,93 @@ test('localRateLimit keeps a busy client when new keys flood the table', () => {
     if (i % 500 === 0) __internals.localRateLimit(busy); 
   }
   assert.equal(__internals.localRateLimit(busy), false);
+});
+test('L1 is re-checked after an L2 miss so a concurrently filled entry avoids an upstream call', async () => {
+  let upstreamCalls = 0;
+  let l2Calls = 0;
+  let releaseL2;
+  const l2Gate = new Promise((resolve) => { releaseL2 = resolve; });
+  await withGlobalRuntimeMocks(async () => {
+    const query = makeQuery('l1recheck.example');
+    const slow = postQuery('l1recheck.example', 'l1-recheck');
+    await new Promise((resolve) => setImmediate(resolve));
+    const key = await __internals.makeCacheKey(query);
+    __internals.setCache(key, __internals.normalizeDNSResponseID(makeAResponse(query, 100).buffer), 100);
+    releaseL2();
+    const res = await slow;
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('x-cache'), 'L1-HIT');
+    assert.equal(upstreamCalls, 0);
+  }, {
+    fetch: async () => { upstreamCalls += 1; throw new Error('upstream must not be used'); },
+    caches: {
+      default: {
+        match: async () => { l2Calls += 1; if (l2Calls === 1) await l2Gate; return null; },
+        put: async () => {}
+      }
+    }
+  });
+});
+test('hedging: first resolver fails, second answers, third is never contacted', async () => {
+  const calls = [];
+  await withGlobalRuntimeMocks(async () => {
+    const res = await postQuery('hedge-two.example', 'hedge-two');
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('x-upstreams'), '2');
+    assert.equal(calls.length, 2);
+  }, {
+    fetch: async (url, init) => {
+      calls.push(url);
+      if (calls.length === 1) throw new Error('boom');
+      return new Response(makeAResponse(init.body, 60), {
+        status: 200,
+        headers: { 'content-type': 'application/dns-message' }
+      });
+    },
+    caches: cacheMock()
+  });
+});
+test('hedging: all three resolvers failing returns 502 with x-upstreams 3', async () => {
+  await withGlobalRuntimeMocks(async () => {
+    const res = await postQuery('hedge-three.example', 'hedge-three');
+    assert.equal(res.status, 502);
+    assert.equal(res.headers.get('x-upstreams'), '3');
+  }, {
+    fetch: async () => { throw new Error('down'); },
+    caches: cacheMock()
+  });
+});
+test('hedging: the slower attempt is aborted once another resolver answers and is not penalised', async () => {
+  const signals = [];
+  await withGlobalRuntimeMocks(async () => {
+    const before = (await (await worker.fetch(new Request('https://workers.example/health'), {}, {})).json())
+      .upstreams.reduce((sum, u) => sum + u.timeout + u.fail, 0);
+    const res = await postQuery('hedge-abort.example', 'hedge-abort');
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('x-upstreams'), '2');
+    assert.equal(signals[0].aborted, true);
+    const after = (await (await worker.fetch(new Request('https://workers.example/health'), {}, {})).json())
+      .upstreams.reduce((sum, u) => sum + u.timeout + u.fail, 0);
+    assert.equal(after, before);
+  }, {
+    fetch: (url, init) => {
+      signals.push(init.signal);
+      if (signals.length === 1) {
+        return new Promise((_resolve, reject) => {
+          init.signal.addEventListener('abort', () => reject(new Error('aborted')));
+        });
+      }
+      return Promise.resolve(new Response(makeAResponse(init.body, 60), {
+        status: 200,
+        headers: { 'content-type': 'application/dns-message' }
+      }));
+    },
+    caches: cacheMock()
+  });
+});
+test('dashboard forbids framing and is served with a restrictive CSP', async () => {
+  const res = await worker.fetch(new Request('https://workers.example/'), {}, {});
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-security-policy'), /frame-ancestors 'none'/);
+  assert.match(await res.text(), /v0\.2\.8/);
 });

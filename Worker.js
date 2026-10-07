@@ -1,4 +1,4 @@
-const VERSION = '0.2.5';
+const VERSION = '0.2.8';
 const CONFIG = {
   DNS_PATH: '/dns-query',
   EDGE_CACHE_ENABLED: true,
@@ -90,20 +90,15 @@ async function handleDNS(req, url, ctx) {
   }
   const cacheKey = await makeCacheKey(payload);
   const localHit = getCache(cacheKey);
-  if (localHit) {
-    const ageSeconds = Math.max(0, Math.floor((Date.now() - localHit.storedAt) / 1000));
-    const responseBody = patchDNSResponseForAge(localHit.body, parsed.id, ageSeconds, payload);
-    return dnsResponse(responseBody, {
-      'x-cache': 'L1-HIT',
-      'x-edge-cache': 'SKIP',
-      'x-upstreams': '0'
-    });
-  }
+  if (localHit) return l1Response(localHit, parsed.id, payload);
   const existing = APP_STATE.inflight.get(cacheKey);
   if (existing) return awaitCoalesced(existing, parsed, payload);
   if (CONFIG.EDGE_CACHE_ENABLED) {
     const edgeHit = await getEdgeCache(cacheKey, parsed.id, url.origin, payload);
-    if (edgeHit) {
+    if (!edgeHit) {
+      const filled = getCache(cacheKey);
+      if (filled) return l1Response(filled, parsed.id, payload);
+    } else {
       setCache(
         cacheKey,
         edgeHit.body,
@@ -138,7 +133,7 @@ async function handleDNS(req, url, ctx) {
           ctx?.waitUntil?.(putEdgeCache(
             cacheKey,
             normalizedBody,
-            ttlSeconds, 
+            ttlSeconds,
             storedAt,
             url.origin
           ));
@@ -148,7 +143,6 @@ async function handleDNS(req, url, ctx) {
     return {
       ...result,
       body: normalizedBody,
-      ttlSeconds,
       storedAt
     };
   })();
@@ -167,22 +161,30 @@ async function handleDNS(req, url, ctx) {
     if (result.degraded) headers['x-dns-degraded'] = '1';
     return dnsResponse(responseBody, headers);
   } catch (err) {
-    return upstreamFailureResponse(err, resolvers.length);
+    return upstreamFailureResponse(err?.attempts ?? resolvers.length);
   } finally {
     if (APP_STATE.inflight.get(cacheKey) === job) APP_STATE.inflight.delete(cacheKey);
   }
 }
+function l1Response(entry, queryID, queryBytes) {
+  const ageSeconds = Math.max(0, Math.floor((Date.now() - entry.storedAt) / 1000));
+  return dnsResponse(patchDNSResponseForAge(entry.body, queryID, ageSeconds, queryBytes), {
+    'x-cache': 'L1-HIT',
+    'x-edge-cache': 'SKIP',
+    'x-upstreams': '0'
+  });
+}
 async function awaitCoalesced(job, parsed, queryBytes) {
   try {
     return coalescedDNSResponse(await job, parsed, queryBytes);
-  } catch (err) {
-    return upstreamFailureResponse(err);
+  } catch (_) {
+    return upstreamFailureResponse(0);
   }
 }
-function upstreamFailureResponse(err, fallbackAttempts = 0) {
+function upstreamFailureResponse(attempts) {
   return textResponse('Global resolving failed', 502, {
     'cache-control': 'no-store',
-    'x-upstreams': String(err?.attempts || fallbackAttempts)
+    'x-upstreams': String(attempts)
   });
 }
 function coalescedDNSResponse(shared, parsed, queryBytes) {
@@ -305,7 +307,7 @@ function parseDNSQuestion(packet) {
   if (qdcount !== 1 || ancount !== 0 || nscount !== 0) {
     return { ok: false, error: 'Invalid DNS query section counts' };
   }
-  const questionEnd = skipDNSName(bytes, 12);
+  const questionEnd = skipDNSName(bytes, 12, false);
   if (questionEnd < 0 || questionEnd + 4 > bytes.length) {
     return { ok: false, error: 'Incomplete DNS question' };
   }
@@ -333,11 +335,12 @@ function selectRacers(resolvers) {
   const chosen = pool[APP_STATE.primaryCursor++ % pool.length];
   return [chosen, ...ranked.filter((node) => node !== chosen)];
 }
+const HEDGE_TIMER = Symbol('hedge-timer');
 async function resolveWithHedging(nodes, packet, expectedID) {
   if (!nodes.length) throw new Error('No upstreams configured');
   const controllers = new Map();
   const active = new Map();
-  const attempts = [];
+  let attempts = 0;
   let nextIndex = 0;
   let fallback = null;
   const startAttempt = (node) => {
@@ -347,84 +350,63 @@ async function resolveWithHedging(nodes, packet, expectedID) {
       .then((value) => ({ ok: true, node, value }))
       .catch((error) => ({ ok: false, node, error }));
     active.set(node, promise);
-    attempts.push(node);
+    attempts += 1;
   };
   startAttempt(nodes[nextIndex++]);
   let hedgeDelay = getHedgeDelay(nodes[0]);
   try {
     while (active.size) {
-      const result = await raceUntilActiveSettles(active, hedgeDelay);
-      if (result.type === 'timer') {
-        if (nextIndex < nodes.length) {
-          startAttempt(nodes[nextIndex++]);
-          hedgeDelay = CONFIG.SECONDARY_HEDGE_MS;
-          continue;
-        }
-        hedgeDelay = CONFIG.UPSTREAM_TIMEOUT_MS;
+      const result = await raceAttempts(active, nextIndex >= nodes.length ? null : hedgeDelay);
+      if (result === HEDGE_TIMER) {
+        startAttempt(nodes[nextIndex++]);
+        hedgeDelay = CONFIG.SECONDARY_HEDGE_MS;
         continue;
       }
       active.delete(result.node);
       if (result.ok) {
         const value = result.value;
         if (value.usable) {
-          abortAttempts(controllers, result.node);
           return {
             ...value,
-            attempts: attempts.length
+            attempts
           };
         }
         fallback = value;
-        if (nextIndex < nodes.length && active.size === 0) {
-          startAttempt(nodes[nextIndex++]);
-          hedgeDelay = nextIndex === 2
-            ? CONFIG.SECONDARY_HEDGE_MS
-            : CONFIG.UPSTREAM_TIMEOUT_MS;
-        }
-        continue;
       }
       if (nextIndex < nodes.length) {
-        if (active.size === 0) {
-          startAttempt(nodes[nextIndex++]);
-          hedgeDelay = nextIndex === 2
-            ? CONFIG.SECONDARY_HEDGE_MS
-            : CONFIG.UPSTREAM_TIMEOUT_MS;
-        } else {
-          hedgeDelay = CONFIG.SECONDARY_HEDGE_MS;
-        }
+        if (active.size === 0) startAttempt(nodes[nextIndex++]);
+        hedgeDelay = CONFIG.SECONDARY_HEDGE_MS;
       }
     }
     if (fallback) {
       return {
         ...fallback,
-        attempts: attempts.length
+        attempts
       };
     }
     const err = new Error('All DNS upstreams failed');
-    err.attempts = attempts.length;
+    err.attempts = attempts;
     throw err;
   } finally {
     abortAttempts(controllers);
   }
 }
-async function raceUntilActiveSettles(active, timeoutMs) {
+async function raceAttempts(active, timeoutMs) {
+  const racers = [...active.values()];
+  if (timeoutMs == null) return Promise.race(racers);
   let timeoutId;
   const timer = new Promise((resolve) => {
-    timeoutId = setTimeout(() => resolve({ type: 'timer' }), timeoutMs);
+    timeoutId = setTimeout(() => resolve(HEDGE_TIMER), timeoutMs);
   });
-  const settled = [...active.values()].map((promise) =>
-    promise.then((result) => ({ type: 'result', ...result }))
-  );
   try {
-    return await Promise.race([timer, ...settled]);
+    return await Promise.race([timer, ...racers]);
   } finally {
     clearTimeout(timeoutId);
   }
 }
-function abortAttempts(controllers, winnerNode) {
-  for (const [node, controller] of controllers) {
-    if (!winnerNode || node !== winnerNode) {
-      try { controller.abort('winner-selected'); } catch (_) {}
-    }
+function abortAttempts(controllers) {
+  for (const controller of controllers.values()) {
+    try { controller.abort('winner-selected'); } catch (_) {}
   }
 }
 function getHedgeDelay(node) {
@@ -485,16 +467,12 @@ async function relay(node, packet, expectedID, signal) {
       degraded: !usable
     };
   } catch (err) {
-    const message = String(err && err.message ? err.message : err);
-    const raceAbort = signal?.aborted && !timeoutController.signal.aborted;
-    const timeoutAbort = timeoutController.signal.aborted
-      || message.toLowerCase().includes('timeout');
-    if (raceAbort) throw err;
-    if (timeoutAbort) {
+    if (signal.aborted && !timeoutController.signal.aborted) throw err;
+    if (timeoutController.signal.aborted) {
       node.timeout += 1;
       penalize(node, CONFIG.SCORE_TIMEOUT_DELTA, 'timeout', false);
     } else {
-      penalize(node, CONFIG.SCORE_FAILURE_DELTA, message);
+      penalize(node, CONFIG.SCORE_FAILURE_DELTA, err && err.message ? err.message : err);
     }
     throw err;
   } finally {
@@ -533,8 +511,8 @@ function normalizeUncompressedQuestionName(bytes) {
   while (offset < bytes.length) {
     const len = bytes[offset];
     if (len === 0) return;
-    if ((len & 0xc0) !== 0) return; 
-    if (len > 63 || offset + 1 + len > bytes.length) return;
+    if ((len & 0xc0) !== 0) return;
+    if (offset + 1 + len > bytes.length) return;
     for (let i = offset + 1; i <= offset + len; i++) {
       const value = bytes[i];
       if (value >= 65 && value <= 90) bytes[i] = value + 32;
@@ -549,7 +527,7 @@ async function makeCacheKey(packet) {
   normalized[1] = 0;
   normalizeUncompressedQuestionName(normalized);
   const digest = await crypto.subtle.digest('SHA-256', normalized);
-  const view = new Uint8Array(digest, 0, 16); 
+  const view = new Uint8Array(digest, 0, 16);
   let out = '';
   for (let i = 0; i < view.length; i++) out += view[i].toString(16).padStart(2, '0');
   return out;
@@ -580,7 +558,7 @@ function getDNSCacheTTL(responseBuffer) {
   if (bytes.length < 12) return 0;
   const flags = (bytes[2] << 8) | bytes[3];
   if ((flags & 0x8000) === 0) return 0;
-  if ((flags & 0x0200) !== 0) return 0; 
+  if ((flags & 0x0200) !== 0) return 0;
   const rcode = flags & 0x000f;
   if (rcode !== 0 && rcode !== 3) return 0;
   const qdcount = (bytes[4] << 8) | bytes[5];
@@ -633,17 +611,17 @@ function getDNSCacheTTL(responseBuffer) {
     CONFIG.EDGE_CACHE_MAX_TTL_SECONDS
   );
 }
-function skipDNSName(bytes, offset) {
+function skipDNSName(bytes, offset, allowPointer = true) {
   let pos = offset;
-  let wireLength = 1; 
+  let wireLength = 1;
   while (pos < bytes.length) {
     const len = bytes[pos];
     if (len === 0) return pos + 1;
     if ((len & 0xc0) === 0xc0) {
-      if (pos + 1 >= bytes.length) return -1;
+      if (!allowPointer || pos + 1 >= bytes.length) return -1;
       return pos + 2;
     }
-    if ((len & 0xc0) !== 0 || len > 63 || pos + 1 + len > bytes.length) return -1;
+    if ((len & 0xc0) !== 0 || pos + 1 + len > bytes.length) return -1;
     wireLength += len + 1;
     if (wireLength > 255) return -1;
     pos += 1 + len;
@@ -655,7 +633,7 @@ function readResourceRecord(bytes, offset) {
   if (nameEnd < 0 || nameEnd + 10 > bytes.length) return null;
   const type = (bytes[nameEnd] << 8) | bytes[nameEnd + 1];
   let ttl = readUint32(bytes, nameEnd + 4);
-  if (ttl > 0x7fffffff) ttl = 0; 
+  if (ttl > 0x7fffffff) ttl = 0;
   const rdLength = (bytes[nameEnd + 8] << 8) | bytes[nameEnd + 9];
   const rdataOffset = nameEnd + 10;
   const rdEnd = rdataOffset + rdLength;
@@ -697,10 +675,11 @@ function patchDNSResponseForAge(responseBuffer, queryID, ageSeconds, queryBytes)
   const bytes = new Uint8Array(responseBuffer);
   const copy = new Uint8Array(bytes.length);
   copy.set(bytes);
+  if (copy.length < 12) return copy.buffer;
   copy[0] = (queryID >> 8) & 0xff;
   copy[1] = queryID & 0xff;
   if (queryBytes) restoreQuestionCase(copy, queryBytes);
-  if (copy.length < 12 || ageSeconds <= 0) return copy.buffer;
+  if (ageSeconds <= 0) return copy.buffer;
   const qdcount = (copy[4] << 8) | copy[5];
   const ancount = (copy[6] << 8) | copy[7];
   const nscount = (copy[8] << 8) | copy[9];
@@ -750,7 +729,6 @@ async function getEdgeCache(key, queryID, origin, queryBytes) {
     return {
       body,
       storedAt,
-      ttlSeconds,
       remainingSeconds: ttlSeconds - ageSeconds,
       responseBody: patchDNSResponseForAge(body, queryID, ageSeconds, queryBytes)
     };
@@ -912,7 +890,8 @@ export const __internals = {
   patchDNSResponseForAge,
   getHedgeDelay,
   localRateLimit,
-  selectRacers
+  selectRacers,
+  setCache
 };
 function renderUI(host) {
   const safeHost = escapeHtml(host);
@@ -928,7 +907,7 @@ function renderUI(host) {
     <style>
         body { background: #020617; color: #cbd5e1; font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; overflow-x: hidden; }
         .cyber-glass { background: rgba(15, 23, 42, 0.7); backdrop-filter: blur(15px); border: 1px solid rgba(0, 243, 255, 0.08); }
-        .lang-fa { direction: rtl; font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+        .lang-fa { direction: rtl; }
         .nav-active { background: #0ea5e9; color: white !important; border-color: #38bdf8 !important; box-shadow: 0 0 15px rgba(14, 165, 233, 0.3); }
         .panel { display: none; } .panel-active { display: block; animation: fadeInUp 0.3s ease-out; }
         @keyframes fadeInUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
@@ -1024,7 +1003,7 @@ function renderUI(host) {
             en: {
                 main: 'Secure DNS over HTTPS', sub: 'Edge Resolve Network • Intelligent HaGeZi Failover',
                 urlL: 'Endpoint URL', cpT: 'COPY ENDPOINT', copied: 'LINK CAPTURED!', tabC: 'Chrome / Brave / Edge', tabF: 'Firefox', tabM: 'Android / iOS',
-                cH: 'Chromium Browser Settings', cL: '<li>1. Open Browser <b>Settings</b> and find <b>Privacy & Security</b>.</li><li>2. Scroll to <b>"Use Secure DNS"</b>.</li><li>3. Select <b>"With Custom"</b>.</li><li>4. Paste your DoH endpoint URL provided above.</li>',
+                cH: 'Chromium Browser Settings', cL: '<li>1. Open Browser <b>Settings</b> and find <b>Privacy &amp; Security</b>.</li><li>2. Scroll to <b>"Use Secure DNS"</b>.</li><li>3. Select <b>"With Custom"</b>.</li><li>4. Paste your DoH endpoint URL provided above.</li>',
                 fH: 'Firefox Network Options', fL: '<li>1. In Firefox <code>Settings</code>, search for "DNS over HTTPS".</li><li>2. Select <b>Custom</b> from the providers dropdown.</li><li>3. Paste this DoH endpoint URL and save.</li>',
                 mH: 'Mobile Setup Strategy', mD: 'Smartphones often prioritize DoT hostnames in system settings. To use this Worker DoH endpoint:',
                 mL: '<li><b>In Browsers:</b> Setting it directly in Chrome or Firefox for Mobile is the easiest path.</li><li><b>For Apps:</b> Use <b>Intra</b> or <b>RethinkDNS</b> apps and set DoH server to this link.</li>',
@@ -1114,7 +1093,7 @@ function renderUI(host) {
       'cache-control': 'public, max-age=300',
       'x-content-type-options': 'nosniff',
       'referrer-policy': 'no-referrer',
-      'content-security-policy': "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'"
+      'content-security-policy': "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
     }
   });
 }

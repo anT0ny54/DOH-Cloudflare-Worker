@@ -37,7 +37,7 @@ The resolver logic never launches all three upstreams immediately. In-flight dup
 - The first resolver is chosen round-robin among resolvers whose score is within 8 points of the best one; the rest follow in score/latency order.
 - A backup is started if the first attempt has not answered after `1.5 x` its learned latency (clamped to 80-220 ms, so the 120 ms assumed before any sample gives 180 ms) or as soon as it fails. The last-resort resolver is started after a further 150 ms, or immediately when the first two have both failed. The delay timer restarts whenever any attempt settles, so these delays are measured from the most recent event rather than from the start of the request.
 - Each upstream attempt is aborted after 1200 ms. If no resolver produces a usable answer but at least one returned a DNS message with an error code such as `SERVFAIL`, the last such answer is relayed to the client (`x-dns-degraded: 1`); if none returns a DNS message at all, the client gets `502`.
-- Scores only change when a resolver is actually queried; there is no time-based recovery. A resolver that falls more than 8 points behind the best one is no longer picked first and regains points only when it is used as a backup. A `SERVFAIL` for a genuinely broken domain makes the Worker try all three resolvers and lowers all three scores by 12.
+- Scores only change when a resolver is actually queried; there is no time-based recovery. A resolver that falls more than 8 points behind the best one is no longer picked first and regains points only when it is used as a backup. A `SERVFAIL` for a genuinely broken domain makes the Worker try all three resolvers and lowers all three scores by 12; the same applies to any other non-`NOERROR`/`NXDOMAIN` answer, such as a `FORMERR` for a query that passed the Worker's structural checks but that the resolvers reject.
 - Scores, counters, the L1 cache and the in-flight table live in each isolate's memory. They are not shared between isolates or data centers, and `/health` shows only the state of the isolate that answered it.
 
 ### Two-level DNS cache
@@ -46,7 +46,7 @@ The Worker intentionally does **not** enable the global Workers Cache feature in
 
 The Cache API is data-center-local and does not replicate entries automatically between data centers. It is also generally not effective on `*.workers.dev` hostnames, so deploy on a custom domain/route to get L2 hits; on `workers.dev` the Worker still works and simply relies on L1 plus upstream resolution. That is still useful for hot DNS traffic because repeated queries at the same edge location can avoid an upstream lookup entirely.
 
-Both DoH GET and POST requests use the same cache key: the first 128 bits of the SHA-256 of the DNS wire query, with only the transaction ID normalized (all EDNS options, flags and the question type/class remain part of the key, so clients that add a per-query EDNS cookie or variable-length padding produce different keys and get fewer cache hits). ASCII QNAME case is also normalized when the question name is uncompressed, so `example.com`, `EXAMPLE.com`, and mixed-case variants can share a cache entry. Therefore the same DNS question can share a cache entry across GET and POST. When a cached answer is served, the question section is rewritten to the exact letter case the requesting client sent, so DNS 0x20-style case randomization still validates.
+Both DoH GET and POST requests use the same cache key: the first 128 bits of the SHA-256 of the DNS wire query, with only the transaction ID normalized (all EDNS options, flags and the question type/class remain part of the key, so clients that add a per-query EDNS cookie or variable-length padding produce different keys and get fewer cache hits). ASCII QNAME case is also normalized (question names are always uncompressed here, because queries with a compressed question name are rejected before the cache key is computed), so `example.com`, `EXAMPLE.com`, and mixed-case variants can share a cache entry. Therefore the same DNS question can share a cache entry across GET and POST. When a cached answer is served, the question section is rewritten to the exact letter case the requesting client sent, so DNS 0x20-style case randomization still validates.
 
 Only DNS answers that are safe to reuse are cached: `NOERROR` and `NXDOMAIN` responses that are not truncated (TC) and are at most 65,535 bytes. Negative answers (`NXDOMAIN`/`NODATA`) are cached only when they carry an SOA record; the TTL is the smaller of the lowest authority-section record TTL (which includes the SOA TTL) and the SOA `MINIMUM` field, per RFC 2308. Record TTLs with the top bit set are treated as 0 (RFC 2181), so such answers are not cached. `SERVFAIL`, `REFUSED` and similar responses are relayed to the client (marked `x-dns-degraded: 1`) but never cached.
 
@@ -60,9 +60,13 @@ Responses cached internally use DNS TTL-derived expiration. The response transac
 
 DoH DNS messages are normally tiny, so this Worker rejects client messages larger than 4 KiB. It checks `Content-Length` before reading a POST when available and also stream-limits chunked/unknown-length bodies. Upstream resolver responses are independently capped at **65,535 bytes** (the DNS wire-format maximum) and are stream-limited before buffering. These limits avoid spending memory/CPU on oversized abuse traffic while still allowing large legitimate DNSSEC/EDNS answers.
 
+### Query validation
+
+Before any cache or upstream work, the Worker checks that the client message is a plausible single-question DNS query: at least 12 bytes, QR bit clear, opcode 0, `QDCOUNT` = 1 with no answer or authority records, and a complete, well-formed question name (labels of at most 63 bytes, at most 255 bytes on the wire) followed by 4 bytes of type/class. A **compression pointer in the question name is rejected with `400`**: a query's only question has nothing earlier to point to, so a pointer is never valid, and forwarding it would make all three resolvers answer `FORMERR` and lower every resolver score by 12 for a single malformed request. Compression pointers remain supported when the Worker parses *responses*.
+
 ## Deploy with Wrangler
 
-The ZIP includes `wrangler.toml` with the service name `secure-doh-worker` and a `DNS_RATE_LIMITER` binding configured for **100 requests / 60 seconds**. With Wrangler, deploy from the folder containing `Worker.js` and `wrangler.toml` so the binding is created/used. Keep the rate-limit namespace unique if this service must not share counters with another deployment. If the Worker is uploaded through a method that does not apply the Wrangler binding, the script falls back to an in-memory per-isolate limiter.
+The ZIP includes `wrangler.toml` with the service name `secure-doh-worker` and a `DNS_RATE_LIMITER` binding configured for **100 requests / 60 seconds**. With Wrangler (version 4.36.0 or later is required for the `[[ratelimits]]` binding syntax used here), deploy from the folder containing `Worker.js` and `wrangler.toml` so the binding is created/used. Keep the rate-limit namespace unique if this service must not share counters with another deployment. If the Worker is uploaded through a method that does not apply the Wrangler binding, the script falls back to an in-memory per-isolate limiter.
 
 For strict network-wide abuse protection, a Cloudflare WAF Rate Limiting Rule can also be applied to `/dns-query`. Cloudflare notes that rate-limit counters are not globally shared across its entire network, so neither the native binding nor WAF should be treated as one globally exact counter.
 
@@ -82,10 +86,10 @@ https://YOUR-DOMAIN.example/dns-query
 |---|---|
 | `/dns-query` | DoH endpoint (GET and POST), rate limited |
 | `/health` | JSON status: version, resolver scores, cache/in-flight/throttle counters, limits |
-| `/`, `/index.html` | Setup dashboard (EN / FA / ZH). It loads the Tailwind Play CDN script from `cdn.tailwindcss.com`; the DoH endpoint itself does not depend on it |
+| `/`, `/index.html` | Setup dashboard (EN / FA / ZH). It loads the Tailwind Play CDN script from `cdn.tailwindcss.com`; the DoH endpoint itself does not depend on it. Served with a restrictive Content-Security-Policy that includes `frame-ancestors 'none'`, so the page cannot be embedded in a frame |
 | anything else | `404` |
 
-`/dns-query` status codes: `200` DNS message, `400` malformed query or missing `dns` parameter, `405` method other than GET/POST, `413` message larger than 4 KiB (or a GET `dns` parameter longer than 5,462 characters), `415` POST without `application/dns-message`, `429` rate limit exceeded (`Retry-After: 60`), `502` all upstreams failed. The rate-limit check runs first, so a client over the limit receives `429` even when its request would otherwise have been a `405`, `400` or `413`.
+`/dns-query` status codes: `200` DNS message, `400` malformed query (including a compressed question name) or missing `dns` parameter, `405` method other than GET/POST, `413` message larger than 4 KiB (or a GET `dns` parameter longer than 5,462 characters), `415` POST without `application/dns-message`, `429` rate limit exceeded (`Retry-After: 60`), `502` all upstreams failed (the `x-upstreams` header counts the attempts made by *this* request: a request that joined another request's failed in-flight resolution reports `0`). The rate-limit check runs first, so a client over the limit receives `429` even when its request would otherwise have been a `405`, `400` or `413`.
 
 ## DoH methods
 
@@ -107,7 +111,7 @@ Content-Type: application/dns-message
 
 ## Cloudflare Worker notes
 
-The L1 cache is a per-isolate LRU (512 entries, lifetime capped at 300 s or the record's remaining TTL, whichever is shorter). Entries found in L2 are promoted to L1 using their *remaining* TTL, so hot long-TTL names are served from memory even when the L2 entry is older than 300 s. Identical concurrent cache misses within one isolate share a single upstream resolution; if that resolution fails, every waiting request receives the same `502`. L2 Cache API entries can honor authoritative TTLs up to 24 hours, reducing unnecessary upstream resolutions for long-lived DNS records. The per-isolate state (L1 cache, in-flight table, resolver scores, fallback limiter) is lost when the isolate is recycled. Correctness never depends on the Cache API: if L2 is unavailable, misses, or fails, requests fall through to the upstream resolvers. Expired isolate-local cache and throttle entries are swept periodically so `/health` does not retain stale bounded state indefinitely.
+The L1 cache is a per-isolate LRU (512 entries, lifetime capped at 300 s or the record's remaining TTL, whichever is shorter). Entries found in L2 are promoted to L1 using their *remaining* TTL, so hot long-TTL names are served from memory even when the L2 entry is older than 300 s. Identical concurrent cache misses within one isolate share a single upstream resolution; if that resolution fails, every waiting request receives the same `502`. L1 is checked again after an L2 miss, so a request that waited on the Cache API while another request filled L1 is answered from memory (`x-cache: L1-HIT`) instead of starting a redundant upstream query. L2 Cache API entries can honor authoritative TTLs up to 24 hours, reducing unnecessary upstream resolutions for long-lived DNS records. The per-isolate state (L1 cache, in-flight table, resolver scores, fallback limiter) is lost when the isolate is recycled. Correctness never depends on the Cache API: if L2 is unavailable, misses, or fails, requests fall through to the upstream resolvers. Expired isolate-local cache and throttle entries are swept periodically so `/health` does not retain stale bounded state indefinitely.
 
 For a production deployment, attach the Worker to a custom domain and use:
 
@@ -121,13 +125,13 @@ https://dns.yourdomain.com/dns-query
 
 ### Unit tests
 
-Run the included Node.js unit tests from the project folder. Use Node.js 22 or newer (developed and tested on v22); `Worker.js` is an ES module without a `package.json`, so Node must auto-detect module syntax.
+Run the included Node.js unit tests from the project folder. Use Node.js 22.7 or newer (developed and tested on v22; module-syntax detection is enabled by default from 22.7); `Worker.js` is an ES module without a `package.json`, so Node must auto-detect module syntax.
 
 ```bash
 node --test test.mjs
 ```
 
-The suite (36 tests) mocks `fetch` and the Cache API, so it needs no network or Cloudflare account.
+The suite (42 tests) mocks `fetch` and the Cache API, so it needs no network or Cloudflare account.
 
 ### Verifying a deployment
 

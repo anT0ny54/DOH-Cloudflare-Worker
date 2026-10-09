@@ -12,6 +12,7 @@ const CONFIG = {
   RATE_LIMIT_MAX_REQUESTS: 100,
   MAX_THROTTLE_ENTRIES: 2048,
   STATE_SWEEP_INTERVAL_MS: 60_000,
+  INFLIGHT_STALE_MS: 10_000,
   MAX_DNS_MESSAGE_BYTES: 4096,
   MAX_GET_DNS_CHARS: 5462,
   MAX_UPSTREAM_DNS_MESSAGE_BYTES: 65_535,
@@ -146,6 +147,7 @@ async function handleDNS(req, url, ctx) {
       storedAt
     };
   })();
+  job.startedAt = Date.now();
   APP_STATE.inflight.set(cacheKey, job);
   trimMap(APP_STATE.inflight, CONFIG.MAX_INFLIGHT_ENTRIES);
   try {
@@ -521,6 +523,8 @@ function normalizeUncompressedQuestionName(bytes) {
   }
 }
 async function makeCacheKey(packet) {
+  // SHA-256 is hardware-accelerated in the Workers runtime and inputs are
+  // <4KB, so a non-crypto hash buys nothing meaningful here.
   const bytes = packet instanceof Uint8Array ? packet : new Uint8Array(packet);
   const normalized = bytes.slice();
   normalized[0] = 0;
@@ -762,6 +766,14 @@ function maybeSweepState() {
   for (const [ip, stats] of APP_STATE.throttle) {
     if (now >= stats.resetAt) APP_STATE.throttle.delete(ip);
   }
+  // Drop inflight entries whose promise never settled. Jobs normally remove
+  // themselves in a finally block; this only guards the pathological case so
+  // a stuck entry cannot pin a cache key until trimMap eviction.
+  for (const [key, job] of APP_STATE.inflight) {
+    if (now - (job.startedAt || 0) >= CONFIG.INFLIGHT_STALE_MS) {
+      APP_STATE.inflight.delete(key);
+    }
+  }
   APP_STATE.lastSweepAt = now;
 }
 async function allowDNSRequest(ip, env) {
@@ -769,8 +781,9 @@ async function allowDNSRequest(ip, env) {
     try {
       const result = await env.DNS_RATE_LIMITER.limit({ key: ip });
       if (typeof result?.success === 'boolean') return result.success;
-      throw new Error('Invalid DNS_RATE_LIMITER response');
+      // Malformed binding response: fall through to the local limiter below.
     } catch (_) {
+      // Binding unavailable/throwing: fall back to the local limiter.
     }
   }
   return localRateLimit(ip);
@@ -836,7 +849,6 @@ function dnsResponse(body, extraHeaders = {}) {
     headers: {
       'content-type': 'application/dns-message',
       'cache-control': 'no-store',
-      'vary': 'Accept-Encoding',
       ...extraHeaders
     }
   });
@@ -893,10 +905,16 @@ export const __internals = {
   selectRacers,
   setCache
 };
-function renderUI(host) {
-  const safeHost = escapeHtml(host);
-  const endpoint = `https://${safeHost}${CONFIG.DNS_PATH}`;
-  return new Response(`<!DOCTYPE html>
+// The dashboard markup only differs per request in the endpoint URL, so the
+// ~15KB template is built once and cached at module scope.
+let UI_TEMPLATE = null;
+function getUITemplate() {
+  if (UI_TEMPLATE) return UI_TEMPLATE;
+  UI_TEMPLATE = buildUITemplate();
+  return UI_TEMPLATE;
+}
+function buildUITemplate() {
+  return `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -935,7 +953,7 @@ function renderUI(host) {
         <section class="cyber-glass rounded-[3rem] p-8 md:p-14 mb-10 text-center">
             <div class="mb-6">
                 <span class="text-[11px] font-black text-cyan-500 tracking-widest uppercase mb-4 block" id="labelUrl">Endpoint URL</span>
-                <input id="linkInp" value="${endpoint}" readonly class="w-full bg-black/40 border border-slate-800 p-5 rounded-2xl text-cyan-300 font-mono text-center text-sm outline-none focus:border-cyan-500/50 shadow-inner">
+                <input id="linkInp" value="__DOH_ENDPOINT__" readonly class="w-full bg-black/40 border border-slate-800 p-5 rounded-2xl text-cyan-300 font-mono text-center text-sm outline-none focus:border-cyan-500/50 shadow-inner">
             </div>
             <button onclick="copyURL()" class="bg-cyan-600 hover:bg-cyan-400 text-black font-black px-12 py-5 rounded-2xl transition-all shadow-xl active:scale-95">
                 <span id="txtCopy">COPY ENDPOINT</span>
@@ -1086,7 +1104,13 @@ function renderUI(host) {
         window.onload = () => changeLang(getStoredLanguage());
     </script>
 </body>
-</html>`, {
+</html>`;
+}
+function renderUI(host) {
+  const endpoint = escapeHtml(`https://${host}${CONFIG.DNS_PATH}`);
+  // Function replacement avoids '$'-sequence interpretation in the URL.
+  const html = getUITemplate().replaceAll('__DOH_ENDPOINT__', () => endpoint);
+  return new Response(html, {
     status: 200,
     headers: {
       'content-type': 'text/html; charset=utf-8',

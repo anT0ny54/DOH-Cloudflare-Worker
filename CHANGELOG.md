@@ -3,55 +3,63 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.3.2] - 2026-10-15
+## [0.4.0] - 2026-10-15
 
 ### Fixed
-- Cached negative answers (`NXDOMAIN`/`NODATA`) served from L1/L2 now also age
-  the SOA `MINIMUM` field in the authority section. Previously only the SOA
-  record TTL was reduced, so a client computing `min(TTL, MINIMUM)` (RFC 2308)
-  could keep a negative answer for up to its full original lifetime again.
-- The in-flight job for a cache key is now always settled when the request
-  handler exits. If anything unexpected threw before the job was resolved,
-  coalesced joiners previously awaited a promise that never settled; they now
-  receive `502`.
-- Scheduling the L2 write with `ctx.waitUntil` can no longer fail a request:
-  the call is guarded (`runInBackground`).
-- Corrected a misleading comment: the buffer restored in place on the miss
-  path is shared with the L1 entry and coalesced joiners (harmless, because
-  every response re-applies its own client's QNAME case).
+- Cached negative answers no longer modify SOA `MINIMUM`. That field is signed
+  RDATA, so changing it broke DNSSEC validation. The SOA record TTL is now served
+  as `min(SOA TTL, SOA MINIMUM) - age`, as RFC 2308 requires.
+- `NOERROR` CNAME chains ending in NODATA now honour the authority SOA
+  `MINIMUM` instead of being cached for the CNAME/SOA TTL.
+- IPv6 rate limiting uses one /64 key for the native binding and the local
+  fallback, so rotating addresses within a /64 no longer gets fresh windows.
+- The in-flight job is rejected in `finally` only when it was not already
+  settled; successful requests no longer allocate an unused `Error`.
+- Unexpected request-body errors return `Invalid DNS query` instead of exposing
+  internal runtime messages.
+- Fallback answers are chosen by usefulness: truncated `NOERROR` beats
+  truncated `NXDOMAIN`, which beats `SERVFAIL` and other RCODEs.
+- The 255-byte name limit is enforced across compression pointers.
+- Responses with OPT outside the additional section, duplicate OPT records or a
+  non-root OPT owner are rejected. Extended RCODE bits are included in usability
+  and caching checks.
+- Test fixture fix: the "truncated" response helper set RCODE 2 instead of the
+  TC flag; it now sets TC correctly.
+
+### Removed
+- The L1 re-check after an L2 miss. Synchronous in-flight registration makes it
+  unreachable in normal operation.
+- The resolver-ranking cache. Every upstream result invalidated it, so the
+  cached branch never ran.
+- `EDGE_CACHE_MIN_TTL_SECONDS`, the redundant TTL floor/floor-rounding, and the
+  `validateDNSResponse` pass-through wrapper.
+- Test-only hooks from the production module. `Worker.js` now exports only the
+  Worker handler; tests use `worker-harness.mjs`.
+- Redundant dashboard panel-class toggling.
 
 ### Changed
-- **Removed the L2 "refresh on hit" write-back.** It re-`put` the entry with
-  its remaining TTL, which expires at the same moment as the original entry,
-  so it extended nothing while costing a Cache API subrequest on every L2 hit
-  (and the age rounding could add sub-second drift on repeated refreshes). An
-  L2 hit now performs one Cache API `match` and no `put`, matching the table
-  in the README. Hot keys are still served from L1 after the first L2 hit.
-- `patchDNSResponseForAge` makes one copy of the cached body instead of two
-  and accepts either an `ArrayBuffer` or a `Uint8Array`; a shared
-  `writeUint32` helper replaces the inline TTL byte writes.
-- `resetResolverState` is no longer exported through `__internals` (it is
-  still used by `resetAppState`; no test called it directly).
-- `package.json`: version `0.3.2`; `engines.node` set to `>=22` to match the
-  README and CI.
-- CI workflow: least-privilege `permissions: contents: read`; trailing
-  whitespace removed.
-- README updated to match the implementation: no L2 write-back, best-effort
-  Cache API `delete` on purge, SOA `MINIMUM` ageing, upstream redirects
-  rejected, truncated (TC) answers treated as unusable, question echo is
-  checked on every response that carries a question (required for `NOERROR`),
-  invalid base64url listed under `400`, `x-winner` header note, aborted
-  in-flight jobs, test count.
-
-### Reviewed, no change needed
-- No dead functions, unused `CONFIG` keys or unused/undefined CSS classes were
-  found in `Worker.js` (every helper has a caller; every inlined utility class
-  is used and every used class is defined).
+- One validation pass now checks the DNS response, calculates cache TTL and
+  records TTL offsets. L1 hits patch those offsets directly.
+- Expired or corrupt L2 entries are purged with `ctx.waitUntil` instead of
+  delaying the request.
+- L1 has an 8 MiB body budget in addition to its 512-entry limit.
+- Resolver scores recover by +1 per minute, up to 100. If all attempted
+  resolvers return an error RCODE, none is penalised.
+- EDNS Padding is removed from the cache key. EDNS Cookies stay in the key
+  because cached responses echo client-specific cookies.
+- Upstream timeouts use `AbortSignal.timeout`.
+- Shared ASCII lower-casing and the parsed question end remove repeated
+  question-name parsing.
+- Dashboard HTML is split once around the endpoint placeholder; the clipboard
+  fallback is feature-checked; iOS guidance no longer recommends Android-only
+  Intra.
+- CI uses current `actions/checkout@v7` and `actions/setup-node@v7`, checks
+  syntax, and runs a Wrangler dry-run deployment.
 
 ### Tests
-- 75 tests (was 74). Removed the three L2-refresh tests (behavior removed).
-  Added: L2 hit serves age-adjusted TTLs with no Cache API `put`; throwing
-  `ctx.waitUntil` does not break a cache miss; SOA `MINIMUM` ageing (including
-  clamping at zero and source buffer left untouched); `patchDNSResponseForAge`
-  with `ArrayBuffer` and `Uint8Array` input without mutating the source.
+- 88 tests. The coalescing tests now prove that joiners attach to the leader
+  (`COALESCED` and upstream call count), and new tests cover the fixes above,
+  405, GET/Content-Length size guards, upstream timeouts, expired L1/L2 entries,
+  native limiter exceptions, penalty eviction, the L1 byte budget and padding-
+  insensitive cache keys.
 

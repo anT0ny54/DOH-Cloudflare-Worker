@@ -1,12 +1,13 @@
-const VERSION = '0.3.2';
+const VERSION = '0.4.0';
 const CONFIG = {
   DNS_PATH: '/dns-query',
   EDGE_CACHE_ENABLED: true,
   EDGE_CACHE_PATH: '/__doh-cache/v1',
   LOCAL_CACHE_MAX_TTL_SECONDS: 300,
   EDGE_CACHE_MAX_TTL_SECONDS: 86_400,
-  EDGE_CACHE_MIN_TTL_SECONDS: 1,
   MAX_CACHE_ENTRIES: 512,
+  MAX_CACHE_BYTES: 8 * 1024 * 1024,
+  SCORE_RECOVERY_INTERVAL_MS: 60_000,
   MAX_INFLIGHT_ENTRIES: 128,
   RATE_LIMIT_WINDOW_MS: 60_000,
   RATE_LIMIT_MAX_REQUESTS: 100,
@@ -41,10 +42,12 @@ const RESOLVER_NODES = HAGEZI_UPSTREAMS.map((url, order) => ({
   timeout: 0,
   lastLatencyMs: null,
   ewmaLatencyMs: null,
+  lastScoreUpdateAt: 0,
   lastError: null
 }));
 const APP_STATE = {
   cache: new Map(),
+  cacheBytes: 0,
   throttle: new Map(),
   penalty: new Map(),
   inflight: new Map(),
@@ -83,7 +86,7 @@ async function handleDNS(req, url, ctx) {
   try {
     payload = await readDNSPayload(req, url);
   } catch (err) {
-    return textResponse(err.message || 'Invalid DNS query', err.status || 400, {
+    return textResponse(err.status ? err.message : 'Invalid DNS query', err.status || 400, {
       'cache-control': 'no-store'
     });
   }
@@ -91,7 +94,7 @@ async function handleDNS(req, url, ctx) {
   if (!parsed.ok) {
     return textResponse(parsed.error, 400, { 'cache-control': 'no-store' });
   }
-  const cacheKey = await makeCacheKey(payload);
+  const cacheKey = await makeCacheKey(payload, parsed.questionEnd);
   const localHit = getCache(cacheKey);
   if (localHit) return l1Response(localHit, parsed.id, payload);
   const existing = APP_STATE.inflight.get(cacheKey);
@@ -100,6 +103,7 @@ async function handleDNS(req, url, ctx) {
   // concurrent cold-cache misses coalesce onto this entry. Registering after
   // the L2 check let two simultaneous misses both pass the check and each
   // create their own upstream job (duplicate subrequests, doubled load).
+  let settled = false;
   let settleJob;
   const job = new Promise((resolve, reject) => { settleJob = { resolve, reject }; });
   // A failed job with no joiners must not surface as an unhandled rejection;
@@ -111,13 +115,14 @@ async function handleDNS(req, url, ctx) {
     let shared = null;
     let response = null;
     if (CONFIG.EDGE_CACHE_ENABLED) {
-      const edgeHit = await getEdgeCache(cacheKey, parsed.id, url.origin, payload);
+      const edgeHit = await getEdgeCache(cacheKey, parsed.id, url.origin, payload, ctx);
       if (edgeHit) {
         setCache(
           cacheKey,
           edgeHit.body,
           Math.min(edgeHit.remainingSeconds, CONFIG.LOCAL_CACHE_MAX_TTL_SECONDS),
-          edgeHit.storedAt
+          edgeHit.storedAt,
+          edgeHit.metadata
         );
         // No write-back on an L2 hit: re-putting the entry with its
         // *remaining* TTL expires at the same instant as the original (and
@@ -125,6 +130,7 @@ async function handleDNS(req, url, ctx) {
         // would cost a Cache API subrequest without extending anything.
         shared = {
           body: edgeHit.body,
+          metadata: edgeHit.metadata,
           storedAt: edgeHit.storedAt,
           url: null,
           latencyMs: 0,
@@ -138,26 +144,11 @@ async function handleDNS(req, url, ctx) {
       }
     }
     if (!response) {
-      // L1 may have been filled by a concurrent request while the L2 lookup
-      // was in flight.
-      const filled = getCache(cacheKey);
-      if (filled) {
-        shared = {
-          body: filled.body,
-          storedAt: filled.storedAt,
-          url: null,
-          latencyMs: 0,
-          degraded: false
-        };
-        response = l1Response(filled, parsed.id, payload);
-      }
-    }
-    if (!response) {
       const resolvers = selectRacers(RESOLVER_NODES);
       try {
-        const result = await resolveWithHedging(resolvers, payload, parsed.id);
+        const result = await resolveWithHedging(resolvers, payload, parsed.id, parsed.questionEnd);
         const storedAt = Date.now();
-        const ttlSeconds = getDNSCacheTTL(result.body);
+        const ttlSeconds = result.metadata.ttl;
         // The stored body keeps the winning upstream's transaction ID; it is
         // rewritten per request in patchDNSResponseForAge. This removes the
         // old normalize-then-patch double copy on the miss path entirely.
@@ -166,7 +157,8 @@ async function handleDNS(req, url, ctx) {
             cacheKey,
             result.body,
             Math.min(ttlSeconds, CONFIG.LOCAL_CACHE_MAX_TTL_SECONDS),
-            storedAt
+            storedAt,
+            result.metadata
           );
           if (CONFIG.EDGE_CACHE_ENABLED) {
             runInBackground(ctx, putEdgeCache(
@@ -180,6 +172,7 @@ async function handleDNS(req, url, ctx) {
         }
         shared = {
           body: result.body,
+          metadata: result.metadata,
           storedAt,
           url: result.url,
           latencyMs: result.latencyMs,
@@ -202,19 +195,21 @@ async function handleDNS(req, url, ctx) {
         restoreQuestionCase(new Uint8Array(result.body), payload);
         response = dnsResponse(result.body, headers);
       } catch (err) {
+        settled = true;
         settleJob.reject(err);
         // resolveWithHedging always attaches the real attempt count; 0 covers
         // a pathological throw instead of reporting phantom attempts.
         return upstreamFailureResponse(err?.attempts ?? 0);
       }
     }
+    settled = true;
     settleJob.resolve(shared);
     return response;
   } finally {
     // No-op when already settled. If anything unexpected threw above, this
     // releases joiners (they answer 502) instead of leaving them awaiting a
     // promise nobody will ever settle.
-    settleJob.reject(new Error('DNS resolution aborted'));
+    if (!settled) settleJob.reject(new Error('DNS resolution aborted'));
     if (APP_STATE.inflight.get(cacheKey) === job) APP_STATE.inflight.delete(cacheKey);
   }
 }
@@ -225,7 +220,7 @@ function runInBackground(ctx, promise) {
 }
 function l1Response(entry, queryID, queryBytes) {
   const ageSeconds = Math.max(0, Math.floor((Date.now() - entry.storedAt) / 1000));
-  return dnsResponse(patchDNSResponseForAge(entry.body, queryID, ageSeconds, queryBytes), {
+  return dnsResponse(patchDNSResponseForAge(entry.body, queryID, ageSeconds, queryBytes, entry.metadata), {
     'x-cache': 'L1-HIT',
     'x-edge-cache': 'SKIP',
     'x-upstreams': '0'
@@ -246,7 +241,7 @@ function upstreamFailureResponse(attempts) {
 }
 function coalescedDNSResponse(shared, parsed, queryBytes) {
   const ageSeconds = Math.max(0, Math.floor((Date.now() - shared.storedAt) / 1000));
-  const responseBody = patchDNSResponseForAge(shared.body, parsed.id, ageSeconds, queryBytes);
+  const responseBody = patchDNSResponseForAge(shared.body, parsed.id, ageSeconds, queryBytes, shared.metadata);
   const headers = {
     'x-cache': 'COALESCED',
     'x-edge-cache': 'SKIP',
@@ -392,50 +387,42 @@ function parseDNSQuestion(packet) {
   if (offset !== bytes.length) {
     return { ok: false, error: 'Unexpected trailing bytes in DNS query' };
   }
-  return { ok: true, id };
+  return { ok: true, id, questionEnd };
 }
-let racerRankingCache = null;
-let racerRankingDirty = true;
-function invalidateRacerRanking() {
-  racerRankingDirty = true;
+function recoverScore(node, now = Date.now()) {
+  if (!node.lastScoreUpdateAt) { node.lastScoreUpdateAt = now; return; }
+  const steps = Math.floor((now - node.lastScoreUpdateAt) / CONFIG.SCORE_RECOVERY_INTERVAL_MS);
+  if (steps > 0) {
+    node.score = Math.min(CONFIG.SCORE_START, node.score + steps);
+    node.lastScoreUpdateAt += steps * CONFIG.SCORE_RECOVERY_INTERVAL_MS;
+  }
 }
 function selectRacers(resolvers) {
-  // The ranking only changes when a resolver is rewarded/penalized, so it is
-  // cached and re-sorted only then (score/latency/order are the only inputs).
-  let ranked;
-  if (resolvers === RESOLVER_NODES && !racerRankingDirty) {
-    ranked = racerRankingCache;
-  } else {
-    ranked = [...resolvers].sort((a, b) => {
-      if (b.score !== a.score) return b.score - a.score;
-      const al = a.ewmaLatencyMs ?? Number.MAX_SAFE_INTEGER;
-      const bl = b.ewmaLatencyMs ?? Number.MAX_SAFE_INTEGER;
-      if (al !== bl) return al - bl;
-      return a.order - b.order;
-    });
-    if (resolvers === RESOLVER_NODES) {
-      racerRankingCache = ranked;
-      racerRankingDirty = false;
-    }
+  for (const node of resolvers) recoverScore(node);
+  const ranked = [...resolvers].sort((a, b) => b.score - a.score
+    || (a.ewmaLatencyMs ?? Number.MAX_SAFE_INTEGER) - (b.ewmaLatencyMs ?? Number.MAX_SAFE_INTEGER)
+    || a.order - b.order);
+  let poolSize = 0;
+  while (poolSize < ranked.length && ranked[poolSize].score >= ranked[0].score - 8) poolSize++;
+  if (poolSize > 1) {
+    const index = APP_STATE.primaryCursor++ % poolSize;
+    if (index) ranked.unshift(ranked.splice(index, 1)[0]);
   }
-  const bestScore = ranked[0]?.score ?? 0;
-  const pool = ranked.filter((node) => node.score >= bestScore - 8);
-  if (pool.length <= 1) return ranked;
-  const chosen = pool[APP_STATE.primaryCursor++ % pool.length];
-  return [chosen, ...ranked.filter((node) => node !== chosen)];
+  return ranked;
 }
 const HEDGE_TIMER = Symbol('hedge-timer');
-async function resolveWithHedging(nodes, packet, expectedID) {
+async function resolveWithHedging(nodes, packet, expectedID, questionEnd) {
   if (!nodes.length) throw new Error('No upstreams configured');
   const controllers = new Map();
   const active = new Map();
   let attempts = 0;
   let nextIndex = 0;
   let fallback = null;
+  const errorAnswers = [];
   const startAttempt = (node) => {
     const controller = new AbortController();
     controllers.set(node, controller);
-    const promise = relay(node, packet, expectedID, controller.signal)
+    const promise = relay(node, packet, expectedID, controller.signal, questionEnd)
       .then((value) => ({ ok: true, node, value }))
       .catch((error) => ({ ok: false, node, error }));
     active.set(node, promise);
@@ -455,12 +442,16 @@ async function resolveWithHedging(nodes, packet, expectedID) {
       if (result.ok) {
         const value = result.value;
         if (value.usable) {
+          // An RCODE error is the resolver's fault only if another resolver
+          // answered usefully. If every resolver errors, it is the domain.
+          for (const bad of errorAnswers) penalize(bad.node, CONFIG.SCORE_FAILURE_DELTA, `DNS RCODE ${bad.rcode}`);
           return {
             ...value,
             attempts
           };
         }
-        fallback = value;
+        if (!value.truncated) errorAnswers.push(value);
+        if (!fallback || fallbackPriority(value) > fallbackPriority(fallback)) fallback = value;
       }
       if (nextIndex < nodes.length) {
         if (active.size === 0) startAttempt(nodes[nextIndex++]);
@@ -502,11 +493,13 @@ function getHedgeDelay(node) {
   const learned = node.ewmaLatencyMs ?? 120;
   return clamp(Math.round(learned * 1.5), CONFIG.HEDGE_MIN_MS, CONFIG.HEDGE_MAX_MS);
 }
-async function relay(node, packet, expectedID, signal) {
+function fallbackPriority(value) {
+  return value.rcode === 0 ? 3 : value.rcode === 3 ? 2 : value.rcode === 2 ? 1 : 0;
+}
+async function relay(node, packet, expectedID, signal, questionEnd) {
   const started = Date.now();
-  const timeoutController = new AbortController();
-  const timeout = setTimeout(() => timeoutController.abort('timeout'), CONFIG.UPSTREAM_TIMEOUT_MS);
-  const combinedSignal = AbortSignal.any([signal, timeoutController.signal]);
+  const timeoutSignal = AbortSignal.timeout(CONFIG.UPSTREAM_TIMEOUT_MS);
+  const combinedSignal = AbortSignal.any([signal, timeoutSignal]);
   try {
     const res = await fetch(node.url, {
       method: 'POST',
@@ -542,7 +535,7 @@ async function relay(node, packet, expectedID, signal) {
     // exact view so no foreign bytes are validated, cached, or returned, and
     // the upstream size cap is never undermined by buffer slack.
     const body = toExactArrayBuffer(bodyBytes);
-    const validation = validateDNSResponse(body, expectedID, packet);
+    const validation = validateDNSMessage(body, { expectedID, queryBytes: packet, questionEnd });
     if (!validation.ok) {
       throw new Error(validation.error);
     }
@@ -551,57 +544,48 @@ async function relay(node, packet, expectedID, signal) {
     // A truncated (TC) answer is incomplete: mark it unusable so it loses the
     // resolver race and a complete resolver can win. If every upstream
     // truncates, the truncated fallback is still returned degraded (RFC 8484
-    // permits the TC bit in DoH) and getDNSCacheTTL() refuses to cache it.
+    // permits the TC bit in DoH) and the validator assigns it TTL 0.
     const truncated = validation.truncated;
     const usable = !truncated && (rcode === 0 || rcode === 3);
-    if (usable) {
-      reward(node, latencyMs);
-    } else {
-      penalize(
-        node,
-        CONFIG.SCORE_FAILURE_DELTA,
-        truncated ? 'Truncated DNS response' : `DNS RCODE ${rcode}`
-      );
-    }
+    if (usable) reward(node, latencyMs);
+    else if (truncated) penalize(node, CONFIG.SCORE_FAILURE_DELTA, 'Truncated DNS response');
     return {
       url: node.url,
       body,
       latencyMs,
       rcode,
+      metadata: validation.metadata,
+      node,
+      truncated,
       usable,
       degraded: !usable
     };
   } catch (err) {
-    if (signal.aborted && !timeoutController.signal.aborted) throw err;
-    if (timeoutController.signal.aborted) {
+    if (signal.aborted && !timeoutSignal.aborted) throw err;
+    if (timeoutSignal.aborted) {
       node.timeout += 1;
       penalize(node, CONFIG.SCORE_TIMEOUT_DELTA, 'timeout', false);
     } else {
       penalize(node, CONFIG.SCORE_FAILURE_DELTA, err && err.message ? err.message : err);
     }
     throw err;
-  } finally {
-    clearTimeout(timeout);
   }
 }
 function discardBody(res) {
   try { res.body?.cancel().catch(() => {}); } catch (_) {}
 }
-function validateDNSResponse(responseBuffer, expectedID, queryBytes = null) {
-  return validateDNSMessage(responseBuffer, { expectedID, queryBytes });
-}
-
 // Structural validator shared by the upstream path and the L2 cache path.
 // `expectedID` may be null for L2 bodies: their transaction ID is rewritten
 // per request in patchDNSResponseForAge(), so any stored ID is acceptable.
-function validateDNSMessage(responseBuffer, { expectedID = null, queryBytes = null } = {}) {
+function validateDNSMessage(responseBuffer, { expectedID = null, queryBytes = null, questionEnd = null } = {}) {
   const bytes = responseBuffer instanceof Uint8Array
     ? responseBuffer
     : new Uint8Array(responseBuffer);
   if (bytes.length < 12) return { ok: false, error: 'DNS response too short' };
   const id = (bytes[0] << 8) | bytes[1];
   const flags = (bytes[2] << 8) | bytes[3];
-  const rcode = flags & 0x000f;
+  let rcode = flags & 0x000f;
+  if ((flags & 0x7800) !== 0) return { ok: false, error: 'Unsupported DNS response opcode' };
   const truncated = (flags & 0x0200) !== 0;
   if ((flags & 0x8000) === 0) return { ok: false, error: 'Expected a DNS response, got a query' };
   if (expectedID !== null && id !== expectedID) {
@@ -638,30 +622,57 @@ function validateDNSMessage(responseBuffer, { expectedID = null, queryBytes = nu
     // would be unverifiable and unsafe to cache under the query's key.
     if (rcode === 0) return { ok: false, error: 'DNS response missing question section' };
   } else if (queryBytes) {
-    const match = matchQuestion(bytes, question, queryBytes);
+    const match = matchQuestion(bytes, question, queryBytes, questionEnd);
     if (!match.ok) return match;
   }
   // Walk every declared resource record. Error responses may omit their
   // question, but their declared records must still be structurally valid,
   // and no response may carry undeclared trailing bytes.
-  for (const count of [ancount, nscount, arcount]) {
-    for (let i = 0; i < count; i++) {
+  const records = [];
+  let optCount = 0;
+  let soaMin = Infinity;
+  let recordMin = Infinity;
+  const counts = [ancount, nscount, arcount];
+  for (let section = 0; section < counts.length; section++) {
+    for (let i = 0; i < counts[section]; i++) {
       const rr = readResourceRecord(bytes, offset);
       if (!rr) return { ok: false, error: 'Truncated DNS resource record' };
+      if (rr.type === 41) {
+        if (section !== 2 || bytes[offset] !== 0 || ++optCount > 1) {
+          return { ok: false, error: 'Invalid EDNS OPT record' };
+        }
+        rcode |= bytes[rr.rdataOffset - 6] << 4;
+      } else {
+        let ttl = rr.ttl;
+        if (section === 1 && rr.type === 6) {
+          const mo = findSOAMinimumOffset(bytes, rr.rdataOffset, rr.rdEnd);
+          if (mo >= 0) {
+            const minimum = readUint32(bytes, mo);
+            soaMin = Math.min(soaMin, minimum > 0x7fffffff ? 0 : minimum);
+            ttl = Math.min(ttl, minimum > 0x7fffffff ? 0 : minimum);
+          }
+        }
+        recordMin = Math.min(recordMin, ttl);
+        records.push({ offset: rr.rdataOffset - 6, ttl });
+      }
       offset = rr.rdEnd;
     }
   }
-  if (offset !== bytes.length) {
-    return { ok: false, error: 'Unexpected trailing bytes in DNS response' };
-  }
-  return { ok: true, rcode, truncated };
+  if (offset !== bytes.length) return { ok: false, error: 'Unexpected trailing bytes in DNS response' };
+  let ttl = Math.min(recordMin, soaMin);
+  if (truncated || (rcode !== 0 && rcode !== 3)
+      || ((rcode === 3 || ancount === 0) && soaMin === Infinity)
+      || !Number.isFinite(ttl)) ttl = 0;
+  ttl = Math.max(0, Math.min(ttl, CONFIG.EDGE_CACHE_MAX_TTL_SECONDS));
+  return { ok: true, rcode, truncated, metadata: { ttl, records } };
 }
 
+function lowerAscii(value) { return value >= 65 && value <= 90 ? value + 32 : value; }
 // Compares a response's echoed question against the original query: QNAME
 // case-insensitively (an upstream may re-case labels, cf. 0x20 randomization),
 // QTYPE and QCLASS exactly.
-function matchQuestion(responseBytes, question, queryBytes) {
-  const queryEnd = skipDNSName(queryBytes, 12);
+function matchQuestion(responseBytes, question, queryBytes, questionEnd = null) {
+  const queryEnd = questionEnd ?? skipDNSName(queryBytes, 12);
   if (queryEnd < 0 || queryEnd + 4 > queryBytes.length) {
     return { ok: false, error: 'Original DNS query is unparseable' };
   }
@@ -672,8 +683,8 @@ function matchQuestion(responseBytes, question, queryBytes) {
   for (let i = 0; i < qnameLength; i++) {
     let a = responseBytes[question.nameStart + i];
     let b = queryBytes[12 + i];
-    if (a >= 65 && a <= 90) a += 32;
-    if (b >= 65 && b <= 90) b += 32;
+    a = lowerAscii(a);
+    b = lowerAscii(b);
     if (a !== b) return { ok: false, error: 'DNS response QNAME mismatch' };
   }
   const qtype = (queryBytes[queryEnd] << 8) | queryBytes[queryEnd + 1];
@@ -701,13 +712,13 @@ function reward(node, latencyMs) {
     : Math.round(node.ewmaLatencyMs * 0.8 + latencyMs * 0.2);
   node.lastError = null;
   node.score = clamp(node.score + CONFIG.SCORE_SUCCESS_DELTA, CONFIG.SCORE_MIN, CONFIG.SCORE_MAX);
-  invalidateRacerRanking();
+  node.lastScoreUpdateAt = Date.now();
 }
 function penalize(node, amount, error, countFailure = true) {
   if (countFailure) node.fail += 1;
   node.lastError = String(error || 'unknown').slice(0, 80);
   node.score = clamp(node.score - amount, CONFIG.SCORE_MIN, CONFIG.SCORE_MAX);
-  invalidateRacerRanking();
+  node.lastScoreUpdateAt = Date.now();
 }
 function normalizeUncompressedQuestionName(bytes) {
   let offset = 12;
@@ -718,111 +729,76 @@ function normalizeUncompressedQuestionName(bytes) {
     if (offset + 1 + len > bytes.length) return;
     for (let i = offset + 1; i <= offset + len; i++) {
       const value = bytes[i];
-      if (value >= 65 && value <= 90) bytes[i] = value + 32;
+      bytes[i] = lowerAscii(value);
     }
     offset += 1 + len;
   }
 }
-async function makeCacheKey(packet) {
-  // SHA-256 is hardware-accelerated in the Workers runtime and inputs are
-  // <4KB, so a non-crypto hash buys nothing meaningful here.
-  const bytes = packet instanceof Uint8Array ? packet : new Uint8Array(packet);
-  const normalized = bytes.slice();
-  normalized[0] = 0;
-  normalized[1] = 0;
+function cacheKeyBytes(bytes, questionEnd = skipDNSName(bytes, 12, false)) {
+  const end = questionEnd + 4;
+  const out = [...bytes.subarray(0, end)];
+  out[0] = 0;
+  out[1] = 0;
+  let offset = end;
+  const arcount = (bytes[10] << 8) | bytes[11];
+  for (let i = 0; i < arcount; i++) {
+    const rr = readResourceRecord(bytes, offset);
+    if (!rr) return bytes.slice();
+    if (rr.type !== 41) {
+      out.push(...bytes.subarray(offset, rr.rdEnd));
+    } else {
+      const options = [];
+      for (let p = rr.rdataOffset; p < rr.rdEnd;) {
+        if (p + 4 > rr.rdEnd) return bytes.slice();
+        const code = (bytes[p] << 8) | bytes[p + 1];
+        const len = (bytes[p + 2] << 8) | bytes[p + 3];
+        const next = p + 4 + len;
+        if (next > rr.rdEnd) return bytes.slice();
+        // RFC 7830 padding never changes the answer. Cookies stay in the key:
+        // their echoed client cookie is response-specific.
+        if (code !== 12) options.push(...bytes.subarray(p, next));
+        p = next;
+      }
+      out.push(...bytes.subarray(offset, rr.rdataOffset - 2), options.length >> 8, options.length & 0xff, ...options);
+    }
+    offset = rr.rdEnd;
+  }
+  const normalized = Uint8Array.from(out);
   normalizeUncompressedQuestionName(normalized);
-  const digest = await crypto.subtle.digest('SHA-256', normalized);
+  return normalized;
+}
+async function makeCacheKey(packet, questionEnd) {
+  const bytes = packet instanceof Uint8Array ? packet : new Uint8Array(packet);
+  const digest = await crypto.subtle.digest('SHA-256', cacheKeyBytes(bytes, questionEnd));
   const view = new Uint8Array(digest, 0, 16);
   let out = '';
   for (let i = 0; i < view.length; i++) out += view[i].toString(16).padStart(2, '0');
   return out;
 }
+function deleteCache(key) {
+  const entry = APP_STATE.cache.get(key);
+  if (entry) APP_STATE.cacheBytes -= entry.body.byteLength;
+  APP_STATE.cache.delete(key);
+}
 function getCache(key) {
   const item = APP_STATE.cache.get(key);
   if (!item) return null;
-  if (Date.now() >= item.expiresAt) {
-    APP_STATE.cache.delete(key);
-    return null;
-  }
+  if (Date.now() >= item.expiresAt) { deleteCache(key); return null; }
   APP_STATE.cache.delete(key);
   APP_STATE.cache.set(key, item);
   return item;
 }
-function setCache(key, body, ttlSeconds, storedAt = Date.now()) {
-  const ttl = Math.max(1, Math.floor(ttlSeconds));
-  APP_STATE.cache.delete(key);
+function setCache(key, body, ttlSeconds, storedAt = Date.now(), metadata = null) {
+  if (ttlSeconds <= 0 || body.byteLength > CONFIG.MAX_CACHE_BYTES) return;
+  deleteCache(key);
   APP_STATE.cache.set(key, {
-    body,
-    storedAt,
-    expiresAt: Date.now() + ttl * 1000
+    body, storedAt, metadata: metadata ?? validateDNSMessage(body).metadata,
+    expiresAt: Date.now() + Math.floor(ttlSeconds) * 1000
   });
-  trimMap(APP_STATE.cache, CONFIG.MAX_CACHE_ENTRIES);
-}
-function getDNSCacheTTL(responseBuffer) {
-  const bytes = new Uint8Array(responseBuffer);
-  if (bytes.length < 12) return 0;
-  const flags = (bytes[2] << 8) | bytes[3];
-  if ((flags & 0x8000) === 0) return 0;
-  if ((flags & 0x0200) !== 0) return 0;
-  const rcode = flags & 0x000f;
-  if (rcode !== 0 && rcode !== 3) return 0;
-  const qdcount = (bytes[4] << 8) | bytes[5];
-  const ancount = (bytes[6] << 8) | bytes[7];
-  const nscount = (bytes[8] << 8) | bytes[9];
-  const arcount = (bytes[10] << 8) | bytes[11];
-  let offset = 12;
-  for (let i = 0; i < qdcount; i++) {
-    offset = skipDNSName(bytes, offset);
-    if (offset < 0 || offset + 4 > bytes.length) return 0;
-    offset += 4;
+  APP_STATE.cacheBytes += body.byteLength;
+  while (APP_STATE.cache.size > CONFIG.MAX_CACHE_ENTRIES || APP_STATE.cacheBytes > CONFIG.MAX_CACHE_BYTES) {
+    deleteCache(APP_STATE.cache.keys().next().value);
   }
-  let answerMin = Infinity;
-  let authorityMin = Infinity;
-  let additionalMin = Infinity;
-  let soaNegativeMin = Infinity;
-  const sections = [
-    ['answer', ancount],
-    ['authority', nscount],
-    ['additional', arcount]
-  ];
-  for (const [section, count] of sections) {
-    for (let i = 0; i < count; i++) {
-      const rr = readResourceRecord(bytes, offset);
-      if (!rr) return 0;
-      offset = rr.rdEnd;
-      if (rr.type === 41) continue;
-      if (section === 'answer') {
-        answerMin = Math.min(answerMin, rr.ttl);
-      } else if (section === 'authority') {
-        authorityMin = Math.min(authorityMin, rr.ttl);
-        if (rr.type === 6 && rr.rdLength >= 20) {
-          const minimumOffset = findSOAMinimumOffset(bytes, rr.rdataOffset, rr.rdEnd);
-          if (minimumOffset >= 0) {
-            // RFC 2181: a 32-bit interval with the MSB set means 0, consistent
-            // with how record TTLs are treated in readResourceRecord().
-            const minimum = readUint32(bytes, minimumOffset);
-            soaNegativeMin = Math.min(soaNegativeMin, minimum > 0x7fffffff ? 0 : minimum);
-          }
-        }
-      } else if (section === 'additional') {
-        additionalMin = Math.min(additionalMin, rr.ttl);
-      }
-    }
-  }
-  let ttl;
-  if (rcode === 3 || (rcode === 0 && ancount === 0)) {
-    ttl = soaNegativeMin === Infinity ? Infinity : Math.min(authorityMin, soaNegativeMin);
-  } else {
-    // RFC-correct: minimum TTL across every section present (OPT records are
-    // already excluded), not just the answer section.
-    ttl = Math.min(answerMin, authorityMin, additionalMin);
-  }
-  if (!Number.isFinite(ttl) || ttl <= 0) return 0;
-  return clamp(
-    Math.floor(ttl),
-    CONFIG.EDGE_CACHE_MIN_TTL_SECONDS,
-    CONFIG.EDGE_CACHE_MAX_TTL_SECONDS
-  );
 }
 function skipDNSName(bytes, offset, allowPointer = true) {
   let pos = offset;
@@ -833,7 +809,7 @@ function skipDNSName(bytes, offset, allowPointer = true) {
     if ((len & 0xc0) === 0xc0) {
       if (!allowPointer || pos + 1 >= bytes.length) return -1;
       const target = ((len & 0x3f) << 8) | bytes[pos + 1];
-      if (!isValidNamePointerTarget(bytes, target, pos)) return -1;
+      if (!isValidNamePointerTarget(bytes, target, pos, wireLength)) return -1;
       return pos + 2;
     }
     if ((len & 0xc0) !== 0 || pos + 1 + len > bytes.length) return -1;
@@ -847,8 +823,7 @@ function skipDNSName(bytes, offset, allowPointer = true) {
 // into the header, itself or forward, which also rules out loops) at a
 // well-formed name: labels in bounds, terminating in a root label or another
 // valid backward pointer, within the 255-byte wire limit.
-function isValidNamePointerTarget(bytes, target, pointerPos) {
-  let wireLength = 1;
+function isValidNamePointerTarget(bytes, target, pointerPos, wireLength = 1) {
   let from = pointerPos;
   let pos = target;
   for (let hops = 0; hops < 128; hops++) {
@@ -910,7 +885,6 @@ function writeUint32(bytes, offset, value) {
   bytes[offset + 3] = value & 0xff;
 }
 function restoreQuestionCase(target, query) {
-  const lower = (v) => (v >= 65 && v <= 90 ? v + 32 : v);
   let offset = 12;
   while (offset < query.length && offset < target.length) {
     const len = query[offset];
@@ -918,63 +892,30 @@ function restoreQuestionCase(target, query) {
     if ((len & 0xc0) !== 0 || target[offset] !== len) return;
     if (offset + 1 + len > query.length || offset + 1 + len > target.length) return;
     for (let i = offset + 1; i <= offset + len; i++) {
-      if (lower(query[i]) !== lower(target[i])) return;
+      if (lowerAscii(query[i]) !== lowerAscii(target[i])) return;
     }
     for (let i = offset + 1; i <= offset + len; i++) target[i] = query[i];
     offset += 1 + len;
   }
 }
-function patchDNSResponseForAge(responseBuffer, queryID, ageSeconds, queryBytes) {
-  const source = responseBuffer instanceof Uint8Array
-    ? responseBuffer
-    : new Uint8Array(responseBuffer);
-  // slice() yields an exact-length private copy in a single pass.
+function patchDNSResponseForAge(responseBuffer, queryID, ageSeconds, queryBytes, metadata = null) {
+  const source = responseBuffer instanceof Uint8Array ? responseBuffer : new Uint8Array(responseBuffer);
   const copy = source.slice();
   if (copy.length < 12) return copy.buffer;
   copy[0] = (queryID >> 8) & 0xff;
   copy[1] = queryID & 0xff;
   if (queryBytes) restoreQuestionCase(copy, queryBytes);
-  if (ageSeconds <= 0) return copy.buffer;
-  const qdcount = (copy[4] << 8) | copy[5];
-  const ancount = (copy[6] << 8) | copy[7];
-  const nscount = (copy[8] << 8) | copy[9];
-  const arcount = (copy[10] << 8) | copy[11];
-  let offset = 12;
-  for (let i = 0; i < qdcount; i++) {
-    offset = skipDNSName(copy, offset);
-    if (offset < 0 || offset + 4 > copy.length) return copy.buffer;
-    offset += 4;
+  const info = metadata ?? validateDNSMessage(source).metadata;
+  for (const record of info?.records ?? []) {
+    writeUint32(copy, record.offset, Math.max(0, record.ttl - Math.max(0, ageSeconds)));
   }
-  const counts = [ancount, nscount, arcount];
-  for (let section = 0; section < counts.length; section++) {
-    for (let i = 0; i < counts[section]; i++) {
-      const rr = readResourceRecord(copy, offset);
-      if (!rr) return copy.buffer;
-      if (rr.type !== 41) {
-        writeUint32(copy, rr.rdataOffset - 6, Math.max(0, rr.ttl - ageSeconds));
-        // A negative answer's lifetime is min(SOA TTL, SOA MINIMUM)
-        // (RFC 2308). Ageing only the TTL would let clients keep the full
-        // MINIMUM, so age it too (authority section only: an SOA *answer*
-        // to an SOA query is zone data, not a cache lifetime).
-        if (section === 1 && rr.type === 6) {
-          const minimumOffset = findSOAMinimumOffset(copy, rr.rdataOffset, rr.rdEnd);
-          if (minimumOffset >= 0) {
-            const minimum = readUint32(copy, minimumOffset);
-            if (minimum <= 0x7fffffff) {
-              writeUint32(copy, minimumOffset, Math.max(0, minimum - ageSeconds));
-            }
-          }
-        }
-      }
-      offset = rr.rdEnd;
-    }
-  }
+  // Only RR TTLs change. SOA MINIMUM is signed RDATA and must stay intact.
   return copy.buffer;
 }
 function makeEdgeCacheRequest(origin, key) {
   return new Request(`${origin}${CONFIG.EDGE_CACHE_PATH}/${key}`, { method: 'GET' });
 }
-async function getEdgeCache(key, queryID, origin, queryBytes) {
+async function getEdgeCache(key, queryID, origin, queryBytes, ctx) {
   try {
     const cache = caches.default;
     const cacheKey = makeEdgeCacheRequest(origin, key);
@@ -985,13 +926,14 @@ async function getEdgeCache(key, queryID, origin, queryBytes) {
     const ttlHeader = hit.headers.get('x-doh-ttl');
     const storedAt = Number(storedHeader);
     const ttlSeconds = Number(ttlHeader);
-    if (!Number.isFinite(storedAt) || !Number.isFinite(ttlSeconds) || ttlSeconds <= 0) {
-      await purgeEdgeCache(cache, cacheKey);
+    if (!storedHeader || !ttlHeader || !Number.isFinite(storedAt) || storedAt > Date.now() + 5000
+        || !Number.isInteger(ttlSeconds) || ttlSeconds <= 0 || ttlSeconds > CONFIG.EDGE_CACHE_MAX_TTL_SECONDS) {
+      runInBackground(ctx, purgeEdgeCache(cache, cacheKey));
       return null;
     }
     const ageSeconds = Math.max(0, Math.floor((Date.now() - storedAt) / 1000));
     if (ageSeconds >= ttlSeconds) {
-      await purgeEdgeCache(cache, cacheKey);
+      runInBackground(ctx, purgeEdgeCache(cache, cacheKey));
       return null;
     }
     // Bookkeeping alone is not enough: validate the DNS message itself
@@ -1000,15 +942,16 @@ async function getEdgeCache(key, queryID, origin, queryBytes) {
     // The stored transaction ID is rewritten per request, so it is not part
     // of this check.
     const validation = validateDNSMessage(new Uint8Array(body), { queryBytes });
-    if (!validation.ok) {
-      await purgeEdgeCache(cache, cacheKey);
+    if (!validation.ok || validation.metadata.ttl <= 0 || ttlSeconds > validation.metadata.ttl) {
+      runInBackground(ctx, purgeEdgeCache(cache, cacheKey));
       return null;
     }
     return {
       body,
       storedAt,
+      metadata: validation.metadata,
       remainingSeconds: ttlSeconds - ageSeconds,
-      responseBody: patchDNSResponseForAge(body, queryID, ageSeconds, queryBytes)
+      responseBody: patchDNSResponseForAge(body, queryID, ageSeconds, queryBytes, validation.metadata)
     };
   } catch (_) {
     return null;
@@ -1040,7 +983,7 @@ function maybeSweepState() {
   const now = Date.now();
   if (now - APP_STATE.lastSweepAt < CONFIG.STATE_SWEEP_INTERVAL_MS) return;
   for (const [key, item] of APP_STATE.cache) {
-    if (now >= item.expiresAt) APP_STATE.cache.delete(key);
+    if (now >= item.expiresAt) deleteCache(key);
   }
   for (const [ip, stats] of APP_STATE.throttle) {
     if (now >= stats.resetAt) APP_STATE.throttle.delete(ip);
@@ -1051,6 +994,7 @@ function maybeSweepState() {
   APP_STATE.lastSweepAt = now;
 }
 async function allowDNSRequest(ip, env) {
+  ip = rateLimitKey(ip);
   if (env?.DNS_RATE_LIMITER?.limit) {
     try {
       const result = await env.DNS_RATE_LIMITER.limit({ key: ip });
@@ -1063,6 +1007,7 @@ async function allowDNSRequest(ip, env) {
   return localRateLimit(ip);
 }
 function localRateLimit(ip) {
+  ip = rateLimitKey(ip);
   const now = Date.now();
   // Rejected requests must not re-touch the entry: a flooding client would
   // otherwise stay hot in the LRU table and evict legitimate clients.
@@ -1073,6 +1018,7 @@ function localRateLimit(ip) {
   // A window evicted by an LRU overflow survives in the penalty map, so
   // flooding the table (e.g. IPv6 /64 scanning) cannot reset a client's count.
   let stats = live || APP_STATE.penalty.get(ip);
+  if (!live) APP_STATE.penalty.delete(ip);
   if (!stats || now >= stats.resetAt) {
     stats = { count: 0, resetAt: now + CONFIG.RATE_LIMIT_WINDOW_MS };
   }
@@ -1086,8 +1032,9 @@ function trimThrottleMap() {
   while (APP_STATE.throttle.size > CONFIG.MAX_THROTTLE_ENTRIES) {
     const oldestKey = APP_STATE.throttle.keys().next().value;
     const stats = APP_STATE.throttle.get(oldestKey);
+    const now = Date.now();
     APP_STATE.throttle.delete(oldestKey);
-    if (stats && Date.now() < stats.resetAt) {
+    if (stats && now < stats.resetAt) {
       APP_STATE.penalty.delete(oldestKey);
       APP_STATE.penalty.set(oldestKey, stats);
       if (APP_STATE.penalty.size > CONFIG.MAX_PENALTY_ENTRIES) {
@@ -1101,6 +1048,16 @@ function trimMap(map, maxEntries) {
     const oldestKey = map.keys().next().value;
     map.delete(oldestKey);
   }
+}
+function rateLimitKey(ip) {
+  if (!ip.includes(':') || ip.endsWith('/64')) return ip;
+  const halves = ip.toLowerCase().split('::');
+  if (halves.length > 2 || ip.includes('.')) return ip; // trusted CF header; mapped IPv4 unchanged
+  const left = halves[0] ? halves[0].split(':') : [];
+  const right = halves[1] ? halves[1].split(':') : [];
+  const groups = halves.length === 2 ? [...left, ...Array(Math.max(0, 8-left.length-right.length)).fill('0'), ...right] : left;
+  if (groups.length !== 8 || groups.some(g => !/^[0-9a-f]{1,4}$/.test(g))) return ip;
+  return groups.slice(0, 4).map(g => parseInt(g, 16).toString(16)).join(':') + '::/64';
 }
 function getClientIP(req) {
   return req.headers.get('CF-Connecting-IP') || 'unknown';
@@ -1119,6 +1076,7 @@ function getHealthSnapshot() {
       lastError: node.lastError
     })),
     cacheEntries: APP_STATE.cache.size,
+    cacheBytes: APP_STATE.cacheBytes,
     inflightEntries: APP_STATE.inflight.size,
     throttleEntries: APP_STATE.throttle.size,
     penaltyEntries: APP_STATE.penalty.size,
@@ -1134,6 +1092,7 @@ function getHealthSnapshot() {
     cache: {
       l1: 'in-memory LRU',
       l2: CONFIG.EDGE_CACHE_ENABLED ? 'Cloudflare Cache API (data-center-local)' : 'disabled',
+      maxBytes: CONFIG.MAX_CACHE_BYTES,
       localMaxTTLSeconds: CONFIG.LOCAL_CACHE_MAX_TTL_SECONDS,
       edgeMaxTTLSeconds: CONFIG.EDGE_CACHE_MAX_TTL_SECONDS
     }
@@ -1187,58 +1146,12 @@ function escapeHtml(value) {
     "'": '&#39;'
   }[ch]));
 }
-function resetResolverState() {
-  // Test hook: tests within a file share RESOLVER_NODES, so score-sensitive
-  // tests reset it via beforeEach instead of snapshotting around mutations.
-  for (const node of RESOLVER_NODES) {
-    node.score = CONFIG.SCORE_START;
-    node.ok = 0;
-    node.fail = 0;
-    node.timeout = 0;
-    node.lastLatencyMs = null;
-    node.ewmaLatencyMs = null;
-    node.lastError = null;
-  }
-  invalidateRacerRanking();
-}
-
-// Test-only hook: in addition to resolver statistics, clears every
-// module-level map (L1 cache, throttle, penalty, in-flight jobs) and resets
-// the resolver rotation cursor and sweep timestamp. Tests must await all
-// pending asynchronous work before this runs.
-function resetAppState() {
-  resetResolverState();
-  APP_STATE.cache.clear();
-  APP_STATE.throttle.clear();
-  APP_STATE.penalty.clear();
-  APP_STATE.inflight.clear();
-  APP_STATE.primaryCursor = 0;
-  APP_STATE.lastSweepAt = 0;
-}
-export const __internals = {
-  CONFIG,
-  parseDNSQuestion,
-  validateDNSResponse,
-  validateDNSMessage,
-  decodeBase64Url,
-  makeCacheKey,
-  getDNSCacheTTL,
-  patchDNSResponseForAge,
-  toExactArrayBuffer,
-  readCappedBody,
-  getHedgeDelay,
-  localRateLimit,
-  selectRacers,
-  setCache,
-  resetAppState,
-  hasInflight: (key) => APP_STATE.inflight.has(key)
-};
 // The dashboard markup only differs per request in the endpoint URL, so the
 // ~15KB template is built once and cached at module scope.
 let UI_TEMPLATE = null;
 function getUITemplate() {
   if (UI_TEMPLATE) return UI_TEMPLATE;
-  UI_TEMPLATE = buildUITemplate();
+  UI_TEMPLATE = buildUITemplate().split('__DOH_ENDPOINT__');
   return UI_TEMPLATE;
 }
 function buildUITemplate() {
@@ -1387,7 +1300,7 @@ function buildUITemplate() {
                     <p class="text-slate-500 text-sm mb-6 italic" id="mD">Smartphones often prioritize DoT hostnames in system settings. To use this Worker DoH endpoint:</p>
                     <ul class="list-none space-y-6 text-slate-400 text-sm" id="mL">
                         <li><b>In Browsers:</b> Setting it directly in Chrome or Firefox for Mobile is the easiest path.</li>
-                        <li><b>For Apps:</b> Use <b>Intra</b> or <b>RethinkDNS</b> apps and set DoH server to this link.</li>
+                        <li><b>For Apps:</b> On Android use <b>Intra</b> or <b>RethinkDNS</b>. On iOS install a compatible encrypted-DNS configuration profile.</li>
                     </ul>
                 </div>
             </section>
@@ -1419,7 +1332,7 @@ function buildUITemplate() {
                 cH: 'Chromium Browser Settings', cL: '<li>1. Open Browser <b>Settings</b> and find <b>Privacy &amp; Security</b>.</li><li>2. Scroll to <b>"Use Secure DNS"</b>.</li><li>3. Select <b>"With Custom"</b>.</li><li>4. Paste your DoH endpoint URL provided above.</li>',
                 fH: 'Firefox Network Options', fL: '<li>1. In Firefox <code>Settings</code>, search for "DNS over HTTPS".</li><li>2. Select <b>Custom</b> from the providers dropdown.</li><li>3. Paste this DoH endpoint URL and save.</li>',
                 mH: 'Mobile Setup Strategy', mD: 'Smartphones often prioritize DoT hostnames in system settings. To use this Worker DoH endpoint:',
-                mL: '<li><b>In Browsers:</b> Setting it directly in Chrome or Firefox for Mobile is the easiest path.</li><li><b>For Apps:</b> Use <b>Intra</b> or <b>RethinkDNS</b> apps and set DoH server to this link.</li>',
+                mL: '<li><b>In Browsers:</b> Setting it directly in Chrome or Firefox for Mobile is the easiest path.</li><li><b>For Apps:</b> On Android use <b>Intra</b> or <b>RethinkDNS</b>. On iOS install a compatible encrypted-DNS configuration profile.</li>',
                 whyH: 'Why Browser-Level ONLY? (The Technical Reality)',
                 whyT: '<p>Operating systems like Windows/Android often expect <b>DoT (Port 853)</b> or native resolver formats and may not accept a full <code>https://</code> DoH URL. Workers on Cloudflare run on <b>HTTPS (Port 443)</b>.</p><p><b>Result:</b> Modern browsers include their own DoH engine which works well on Port 443. DoH encrypts DNS queries between your browser and this Worker, but it does not hide destination IPs or guarantee bypass on every network.</p>',
                 curL: 'ENGLISH'
@@ -1430,7 +1343,7 @@ function buildUITemplate() {
                 cH: 'تنظیمات در کروم، اج و بریو', cL: '<li>۱. در تنظیمات مرورگر کلمه DNS را جستجو کنید.</li><li>۲. وارد بخش Security شوید و Use Secure DNS را پیدا کنید.</li><li>۳. آن را روی حالت <b>With Custom</b> قرار دهید.</li><li>۴. آدرس کپی شده از بالای این صفحه را در کادر قرار دهید.</li>',
                 fH: 'تنظیمات در مرورگر فایرفاکس', fL: '<li>۱. در فایرفاکس وارد Settings شوید و DNS over HTTPS را جستجو کنید.</li><li>۲. آن را روی حالت Custom بگذارید.</li><li>۳. لینک اختصاصی خود را وارد و ذخیره کنید.</li>',
                 mH: 'استراتژی راه‌اندازی در موبایل', mD: 'گوشی‌ها معمولاً در تنظیمات سیستمی به دنبال hostname برای DoT هستند؛ برای استفاده از سرویس DoH ما:',
-                mL: '<li><b>داخل مرورگر:</b> بهترین راه تنظیم مستقیم در بخش Secure DNS خودِ کروم یا فایرفاکسِ گوشی است.</li><li><b>برای تمام برنامه‌ها:</b> از اپلیکیشن‌های <b>RethinkDNS</b> یا <b>Intra</b> استفاده کنید و لینک DoH را در آن‌ها ست کنید.</li>',
+                mL: '<li><b>داخل مرورگر:</b> بهترین راه تنظیم مستقیم در بخش Secure DNS خودِ کروم یا فایرفاکسِ گوشی است.</li><li><b>برای تمام برنامه‌ها:</b> از اپلیکیشن‌های <b>RethinkDNS</b> یا <b>Intra</b> در اندروید؛ در iOS از پروفایل DNS رمزگذاری‌شده استفاده کنید و لینک DoH را در آن‌ها ست کنید.</li>',
                 whyH: 'چرا نمی‌توان در خیلی از تنظیمات سیستمی ست کرد؟',
                 whyT: '<p>بسیاری از تنظیمات سیستمی ویندوز یا Private DNS اندروید، معمولاً <b>DoT (پورت ۸۵۳)</b> یا فرمت hostname می‌خواهند و اجازه نمی‌دهند آدرس کامل <code>https://</code> وارد کنید. این Worker روی <b>HTTPS (پورت ۴۴۳)</b> اجرا می‌شود.</p><p><b>راه حل:</b> مرورگرهای مدرن مثل کروم، اج و فایرفاکس موتور داخلی DoH دارند و با این Endpoint سازگارند. DoH درخواست‌های DNS بین مرورگر و این Worker را رمزنگاری می‌کند، اما IP مقصد را مخفی نمی‌کند و تضمین عبور در همه شبکه‌ها نیست.</p>',
                 curL: 'فارسی (FA)'
@@ -1441,7 +1354,7 @@ function buildUITemplate() {
                 cH: 'Chromium 浏览器设置', cL: '<li>1. 进入浏览器“设置”，搜索“安全 DNS”。</li><li>2. 将服务提供商设置为“自定义 (Custom)”。</li><li>3. 粘贴本页面的 DoH 链接，然后重启浏览器生效。</li>',
                 fH: '火狐浏览器配置指南', fL: '<li>1. 在火狐“设置”中搜索 DNS over HTTPS。</li><li>2. 选择自定义提供商。</li><li>3. 输入 DoH 服务器地址并确认保存。</li>',
                 mH: '移动端解析说明', mD: '移动操作系统通常默认系统级 DoT 格式；若要使用此 DoH 服务器:',
-                mL: '<li><b>浏览器设置:</b> 直接在安卓或苹果手机的浏览器（Chrome/Firefox）内按上述桌面步骤配置即可。</li><li><b>全系统生效:</b> 建议安装 <b>RethinkDNS</b> 或 <b>Intra</b> App，并在软件中设置本页面地址。</li>',
+                mL: '<li><b>浏览器设置:</b> 直接在安卓或苹果手机的浏览器（Chrome/Firefox）内按上述桌面步骤配置即可。</li><li><b>全系统生效:</b> 安卓可安装 <b>RethinkDNS</b> 或 <b>Intra</b> App；iOS 请安装兼容的加密 DNS 配置描述文件，并在软件中设置本页面地址。</li>',
                 whyH: '为什么通常建议在浏览器配置? (技术架构说明)',
                 whyT: '<p>Windows 或安卓系统的 Private DNS 设置项通常需要 <b>DoT / 853 端口</b> 或主机名格式，而不一定接受完整 HTTPS URL。本项目基于 <b>Port 443</b> 的 Cloudflare Worker 环境构建。</p><p><b>建议:</b> 浏览器自带独立 DoH 解析器，可直接使用此 Endpoint。DoH 会加密浏览器与此 Worker 之间的 DNS 查询，但不会隐藏目标 IP，也不能保证在所有网络中绕过限制。</p>',
                 curL: '简体中文'
@@ -1478,10 +1391,9 @@ function buildUITemplate() {
             document.getElementById('langMenu').classList.add('hidden');
         }
         function tab(id, el) {
-            document.querySelectorAll('.panel-active').forEach(p => { p.classList.remove('panel-active'); p.classList.add('panel'); });
+            document.querySelectorAll('.panel-active').forEach(p => { p.classList.remove('panel-active'); });
             document.querySelectorAll('.btn-tab').forEach(b => b.classList.remove('nav-active'));
             document.getElementById(id).classList.add('panel-active');
-            document.getElementById(id).classList.remove('panel');
             el.classList.add('nav-active');
         }
         async function copyURL() {
@@ -1492,7 +1404,7 @@ function buildUITemplate() {
                 await navigator.clipboard.writeText(el.value);
             } catch (_) {
                 el.select();
-                document.execCommand('copy');
+                if (!document.execCommand || !document.execCommand('copy')) { alert('Copy failed. Select and copy the endpoint manually.'); return; }
             }
             alert(msg);
         }
@@ -1504,7 +1416,7 @@ function buildUITemplate() {
 function renderUI(host) {
   const endpoint = escapeHtml(`https://${host}${CONFIG.DNS_PATH}`);
   // Function replacement avoids '$'-sequence interpretation in the URL.
-  const html = getUITemplate().replaceAll('__DOH_ENDPOINT__', () => endpoint);
+  const html = getUITemplate().join(endpoint);
   return new Response(html, {
     status: 200,
     headers: {

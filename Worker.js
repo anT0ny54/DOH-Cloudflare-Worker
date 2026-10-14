@@ -1,4 +1,4 @@
-const VERSION = '0.2.9';
+const VERSION = '0.3.0';
 const CONFIG = {
   DNS_PATH: '/dns-query',
   EDGE_CACHE_ENABLED: true,
@@ -317,8 +317,9 @@ async function readCappedBody(source, maxBytes, tooLargeMessage) {
   } finally {
     try { await reader.releaseLock(); } catch (_) {}
   }
-  // A lone chunk is already a fresh, unreferenced Uint8Array from the reader:
-  // return it directly instead of copying.
+  // Fast path: a lone chunk is returned as-is. Callers convert it with
+  // toExactArrayBuffer(), which preserves the view's exact byte range when the
+  // chunk is a subarray of a larger backing buffer.
   if (chunks.length === 1) return chunks[0];
   const out = new Uint8Array(total);
   let offset = 0;
@@ -489,6 +490,10 @@ async function relay(node, packet, expectedID, signal) {
         'content-type': 'application/dns-message'
       },
       body: packet,
+      // A DNS privacy proxy must not silently follow a redirect and forward
+      // the query POST body to a different host: reject redirects and let the
+      // existing failover logic try the next configured resolver.
+      redirect: 'error',
       signal: combinedSignal
     });
     if (!res.ok) {
@@ -508,18 +513,30 @@ async function relay(node, packet, expectedID, signal) {
       CONFIG.MAX_UPSTREAM_DNS_MESSAGE_BYTES,
       'Upstream DNS response too large'
     );
-    const body = bodyBytes.buffer;
-    const validation = validateDNSResponse(body, expectedID);
+    // A Uint8Array can be a subarray of a larger backing buffer; slice to the
+    // exact view so no foreign bytes are validated, cached, or returned, and
+    // the upstream size cap is never undermined by buffer slack.
+    const body = toExactArrayBuffer(bodyBytes);
+    const validation = validateDNSResponse(body, expectedID, packet);
     if (!validation.ok) {
       throw new Error(validation.error);
     }
     const latencyMs = Date.now() - started;
     const rcode = validation.rcode;
-    const usable = rcode === 0 || rcode === 3;
+    // A truncated (TC) answer is incomplete: mark it unusable so it loses the
+    // resolver race and a complete resolver can win. If every upstream
+    // truncates, the truncated fallback is still returned degraded (RFC 8484
+    // permits the TC bit in DoH) and getDNSCacheTTL() refuses to cache it.
+    const truncated = validation.truncated;
+    const usable = !truncated && (rcode === 0 || rcode === 3);
     if (usable) {
       reward(node, latencyMs);
     } else {
-      penalize(node, CONFIG.SCORE_FAILURE_DELTA, `DNS RCODE ${rcode}`);
+      penalize(
+        node,
+        CONFIG.SCORE_FAILURE_DELTA,
+        truncated ? 'Truncated DNS response' : `DNS RCODE ${rcode}`
+      );
     }
     return {
       url: node.url,
@@ -545,15 +562,109 @@ async function relay(node, packet, expectedID, signal) {
 function discardBody(res) {
   try { res.body?.cancel().catch(() => {}); } catch (_) {}
 }
-function validateDNSResponse(responseBuffer, expectedID) {
-  const bytes = new Uint8Array(responseBuffer);
-  if (bytes.length < 12) return { ok: false, error: 'Upstream returned short DNS response' };
+function validateDNSResponse(responseBuffer, expectedID, queryBytes = null) {
+  return validateDNSMessage(responseBuffer, { expectedID, queryBytes });
+}
+
+// Structural validator shared by the upstream path and the L2 cache path.
+// `expectedID` may be null for L2 bodies: their transaction ID is rewritten
+// per request in patchDNSResponseForAge(), so any stored ID is acceptable.
+function validateDNSMessage(responseBuffer, { expectedID = null, queryBytes = null } = {}) {
+  const bytes = responseBuffer instanceof Uint8Array
+    ? responseBuffer
+    : new Uint8Array(responseBuffer);
+  if (bytes.length < 12) return { ok: false, error: 'DNS response too short' };
   const id = (bytes[0] << 8) | bytes[1];
   const flags = (bytes[2] << 8) | bytes[3];
   const rcode = flags & 0x000f;
-  if ((flags & 0x8000) === 0) return { ok: false, error: 'Upstream returned a DNS query, not response' };
-  if (id !== expectedID) return { ok: false, error: 'Upstream response ID mismatch' };
-  return { ok: true, rcode };
+  const truncated = (flags & 0x0200) !== 0;
+  if ((flags & 0x8000) === 0) return { ok: false, error: 'Expected a DNS response, got a query' };
+  if (expectedID !== null && id !== expectedID) {
+    return { ok: false, error: 'DNS response ID mismatch' };
+  }
+  const qdcount = (bytes[4] << 8) | bytes[5];
+  const ancount = (bytes[6] << 8) | bytes[7];
+  const nscount = (bytes[8] << 8) | bytes[9];
+  const arcount = (bytes[10] << 8) | bytes[11];
+  let offset = 12;
+  let question = null;
+  for (let i = 0; i < qdcount; i++) {
+    const nameStart = offset;
+    offset = skipDNSName(bytes, offset);
+    if (offset < 0 || offset + 4 > bytes.length) {
+      return { ok: false, error: 'Truncated DNS question section' };
+    }
+    if (i === 0) {
+      question = {
+        nameStart,
+        nameEnd: offset,
+        qtype: (bytes[offset] << 8) | bytes[offset + 1],
+        qclass: (bytes[offset + 2] << 8) | bytes[offset + 3]
+      };
+    }
+    offset += 4;
+  }
+  if (!question) {
+    // Deliberate handling preserved: DNS error responses may legitimately
+    // omit the question section. A successful (NOERROR) answer may not — it
+    // would be unverifiable and unsafe to cache under the query's key.
+    if (rcode === 0) return { ok: false, error: 'DNS response missing question section' };
+  } else if (queryBytes) {
+    const match = matchQuestion(bytes, question, queryBytes);
+    if (!match.ok) return match;
+  }
+  // Walk every resource record so a valid-header-but-garbage-body answer can
+  // neither be served nor cached. Error answers may carry short/garbage
+  // records; those stay usable-but-degraded instead of failing the attempt.
+  let recordsComplete = true;
+  sectionWalk: for (const count of [ancount, nscount, arcount]) {
+    for (let i = 0; i < count; i++) {
+      const rr = readResourceRecord(bytes, offset);
+      if (!rr) { recordsComplete = false; break sectionWalk; }
+      offset = rr.rdEnd;
+    }
+  }
+  if (!recordsComplete && rcode === 0) {
+    return { ok: false, error: 'Truncated DNS resource record' };
+  }
+  return { ok: true, rcode, truncated };
+}
+
+// Compares a response's echoed question against the original query: QNAME
+// case-insensitively (an upstream may re-case labels, cf. 0x20 randomization),
+// QTYPE and QCLASS exactly.
+function matchQuestion(responseBytes, question, queryBytes) {
+  const queryEnd = skipDNSName(queryBytes, 12);
+  if (queryEnd < 0 || queryEnd + 4 > queryBytes.length) {
+    return { ok: false, error: 'Original DNS query is unparseable' };
+  }
+  const qnameLength = queryEnd - 12;
+  if (question.nameEnd - question.nameStart !== qnameLength) {
+    return { ok: false, error: 'DNS response QNAME mismatch' };
+  }
+  for (let i = 0; i < qnameLength; i++) {
+    let a = responseBytes[question.nameStart + i];
+    let b = queryBytes[12 + i];
+    if (a >= 65 && a <= 90) a += 32;
+    if (b >= 65 && b <= 90) b += 32;
+    if (a !== b) return { ok: false, error: 'DNS response QNAME mismatch' };
+  }
+  const qtype = (queryBytes[queryEnd] << 8) | queryBytes[queryEnd + 1];
+  const qclass = (queryBytes[queryEnd + 2] << 8) | queryBytes[queryEnd + 3];
+  if (question.qtype !== qtype) return { ok: false, error: 'DNS response QTYPE mismatch' };
+  if (question.qclass !== qclass) return { ok: false, error: 'DNS response QCLASS mismatch' };
+  return { ok: true };
+}
+
+// Converts a typed-array chunk to an ArrayBuffer covering exactly the view's
+// bytes. A chunk's backing buffer may extend beyond the view (non-zero
+// byteOffset or trailing slack), so reading .buffer directly can expose,
+// validate, cache, and return bytes that were never part of the response.
+function toExactArrayBuffer(view) {
+  if (view.byteOffset === 0 && view.byteLength === view.buffer.byteLength) {
+    return view.buffer;
+  }
+  return view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength);
 }
 function reward(node, latencyMs) {
   node.ok += 1;
@@ -725,8 +836,11 @@ function findSOAMinimumOffset(bytes, rdataOffset, rdEnd) {
   let pos = skipDNSName(bytes, rdataOffset);
   if (pos < 0 || pos >= rdEnd) return -1;
   pos = skipDNSName(bytes, pos);
-  if (pos < 0 || pos + 20 > rdEnd) return -1;
-  return rdEnd - 4;
+  // Require exactly the five 32-bit fields after the two names. Trailing or
+  // missing bytes mean malformed SOA data that must never drive the negative-
+  // cache lifetime; MINIMUM is the last of those five fixed fields.
+  if (pos < 0 || pos + 20 !== rdEnd) return -1;
+  return pos + 16;
 }
 function readUint32(bytes, offset) {
   return (((bytes[offset] * 0x100 + bytes[offset + 1]) * 0x100 + bytes[offset + 2]) * 0x100 + bytes[offset + 3]) >>> 0;
@@ -802,6 +916,16 @@ async function getEdgeCache(key, queryID, origin, queryBytes) {
     }
     const ageSeconds = Math.max(0, Math.floor((Date.now() - storedAt) / 1000));
     if (ageSeconds >= ttlSeconds) {
+      await purgeEdgeCache(cache, cacheKey);
+      return null;
+    }
+    // Bookkeeping alone is not enough: validate the DNS message itself
+    // (structure plus echoed question) so a corrupt body with plausible
+    // headers is purged and re-resolved upstream instead of being served.
+    // The stored transaction ID is rewritten per request, so it is not part
+    // of this check.
+    const validation = validateDNSMessage(new Uint8Array(body), { queryBytes });
+    if (!validation.ok) {
       await purgeEdgeCache(cache, cacheKey);
       return null;
     }
@@ -1002,19 +1126,37 @@ function resetResolverState() {
   }
   invalidateRacerRanking();
 }
+
+// Test-only hook: in addition to resolver statistics, clears every
+// module-level map (L1 cache, throttle, penalty, in-flight jobs) and resets
+// the resolver rotation cursor and sweep timestamp. Tests must await all
+// pending asynchronous work before this runs.
+function resetAppState() {
+  resetResolverState();
+  APP_STATE.cache.clear();
+  APP_STATE.throttle.clear();
+  APP_STATE.penalty.clear();
+  APP_STATE.inflight.clear();
+  APP_STATE.primaryCursor = 0;
+  APP_STATE.lastSweepAt = 0;
+}
 export const __internals = {
   CONFIG,
   parseDNSQuestion,
   validateDNSResponse,
+  validateDNSMessage,
   decodeBase64Url,
   makeCacheKey,
   getDNSCacheTTL,
   patchDNSResponseForAge,
+  toExactArrayBuffer,
+  readCappedBody,
   getHedgeDelay,
   localRateLimit,
   selectRacers,
   setCache,
   resetResolverState,
+  resetAppState,
   hasInflight: (key) => APP_STATE.inflight.has(key)
 };
 // The dashboard markup only differs per request in the endpoint URL, so the

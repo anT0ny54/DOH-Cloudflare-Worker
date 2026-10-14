@@ -125,7 +125,7 @@ https://dns.yourdomain.com/dns-query
 
 ### Unit tests
 
-Run the included Node.js unit tests from the project folder. Use Node.js 22.7 or newer (developed and tested on v22; module-syntax detection is enabled by default from 22.7). The project ships a minimal `package.json` with `"type": "module"`, so the module type is explicit and older Node versions or bundlers do not have to auto-detect it.
+Run the included Node.js unit tests from the project folder. Use Node.js 22 or newer: the suite imports `Worker.js` directly and relies on stable web-standard globals (`Request`/`Response` with streamed bodies, `ReadableStream`, `AbortSignal.any`) together with the `node --test` runner. The project ships a minimal `package.json` with `"type": "module"`, so the module type is explicit — no module-syntax detection (or `--experimental` flags) is needed.
 
 ```bash
 npm test        # or: node --test

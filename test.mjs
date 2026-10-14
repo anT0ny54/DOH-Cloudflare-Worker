@@ -1,8 +1,10 @@
 import test, { beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import worker, { __internals } from './Worker.js';
-// Resolver state is module-level and shared between tests in this file.
-beforeEach(() => { __internals.resetResolverState(); });
+// Module-level state (resolver statistics, L1/L2 caches, throttle/penalty
+// maps, in-flight jobs, resolver rotation cursor) is shared between tests in
+// this file, so every test starts from a clean slate.
+beforeEach(() => { __internals.resetAppState(); });
 function makeQuery(name, id = 0x1234, flags = 0x0100) {
   const labels = name === '.' ? [] : name.split('.');
   const bytes = [
@@ -103,14 +105,16 @@ test('decodeBase64Url round-trips a DNS query', () => {
 test('decodeBase64Url rejects invalid base64url', () => {
   assert.throws(() => __internals.decodeBase64Url('abc='), /Invalid base64url/);
 });
-test('validateDNSResponse checks ID and response bit', () => {
+test('validateDNSResponse checks ID, response bit, and question echo', () => {
   const query = makeQuery('example.com');
   const response = makeAResponse(query);
-  assert.deepEqual(__internals.validateDNSResponse(response, 0x1234), {
-    ok: true,
-    rcode: 0
-  });
+  const validation = __internals.validateDNSResponse(response, 0x1234, query);
+  assert.equal(validation.ok, true);
+  assert.equal(validation.rcode, 0);
+  assert.equal(validation.truncated, false);
   assert.equal(__internals.validateDNSResponse(response, 0x9999).ok, false);
+  // The response bit check survives when called without the original query.
+  assert.equal(__internals.validateDNSResponse(response, 0x1234).ok, true);
 });
 test('getDNSCacheTTL reads minimum answer TTL', () => {
   const response = makeAResponse(makeQuery('example.com'), 100);
@@ -307,7 +311,7 @@ test('coalesced degraded results propagate x-dns-degraded', async () => {
 test('health reports version and sweep interval', async () => {
   const res = await worker.fetch(new Request('https://workers.example/health'), {}, {});
   const body = await res.json();
-  assert.equal(body.version, '0.2.9');
+  assert.equal(body.version, '0.3.0');
   assert.equal(body.stateSweepIntervalSeconds, 60);
 });
 test('DNS name wire length boundary is enforced', () => {
@@ -744,5 +748,221 @@ test('dashboard forbids framing and is served with a restrictive CSP', async () 
   const res = await worker.fetch(new Request('https://workers.example/'), {}, {});
   assert.equal(res.status, 200);
   assert.match(res.headers.get('content-security-policy'), /frame-ancestors 'none'/);
-  assert.match(await res.text(), /v0\.2\.9/);
+  assert.match(await res.text(), /v0\.3\.0/);
+});
+test('validateDNSResponse rejects QNAME, QTYPE and QCLASS mismatches', () => {
+  const query = makeQuery('mismatch.example');
+  const wrongName = makeAResponse(makeQuery('other.example'));
+  assert.match(__internals.validateDNSResponse(wrongName, 0x1234, query).error, /QNAME/);
+  const wrongType = Array.from(makeAResponse(query));
+  wrongType[query.length - 4] = 0;
+  wrongType[query.length - 3] = 2; // QTYPE A (1) -> NS (2)
+  assert.match(
+    __internals.validateDNSResponse(new Uint8Array(wrongType), 0x1234, query).error,
+    /QTYPE/
+  );
+  const wrongClass = Array.from(makeAResponse(query));
+  wrongClass[query.length - 2] = 0;
+  wrongClass[query.length - 1] = 3; // QCLASS IN (1) -> CH (3)
+  assert.match(
+    __internals.validateDNSResponse(new Uint8Array(wrongClass), 0x1234, query).error,
+    /QCLASS/
+  );
+});
+test('validateDNSResponse accepts case-reordered QNAME echoes (0x20 randomization)', () => {
+  const query = makeQuery('MiXeD.example');
+  const response = makeAResponse(makeQuery('mixed.EXAMPLE'));
+  const validation = __internals.validateDNSResponse(response, 0x1234, query);
+  assert.equal(validation.ok, true);
+  assert.equal(validation.rcode, 0);
+});
+test('validateDNSResponse rejects success answers without a question but accepts error ones', () => {
+  const query = makeQuery('noq.example');
+  const full = makeAResponse(query);
+  const stripQuestion = (src) => {
+    const out = new Uint8Array(12 + (src.length - query.length));
+    out.set(src.slice(0, 12), 0);
+    out[4] = 0;
+    out[5] = 0; // qdcount = 0
+    out.set(src.slice(query.length), 12);
+    return out;
+  };
+  assert.equal(__internals.validateDNSResponse(stripQuestion(full), 0x1234, query).ok, false);
+  const servfail = makeAResponse(query, 60, 2);
+  assert.equal(__internals.validateDNSResponse(stripQuestion(servfail), 0x1234, query).ok, true);
+});
+test('validateDNSResponse rejects successful answers with truncated record sections', () => {
+  const query = makeQuery('truncated.example');
+  const response = Array.from(makeAResponse(query, 100));
+  response.pop(); // cut the final rdata byte so the record overruns the message
+  const validation = __internals.validateDNSResponse(new Uint8Array(response), 0x1234, query);
+  assert.equal(validation.ok, false);
+  assert.match(validation.error, /resource record/i);
+});
+test('upstream responses echoing a different question are rejected and fail over', async () => {
+  await withGlobalRuntimeMocks(async () => {
+    const res = await postQuery('honest.example', 'q-mismatch-test');
+    assert.equal(res.status, 502);
+    assert.equal(res.headers.get('x-upstreams'), '3');
+  }, {
+    fetch: async () => new Response(makeAResponse(makeQuery('evil.example')), {
+      status: 200,
+      headers: { 'content-type': 'application/dns-message' }
+    }),
+    caches: cacheMock()
+  });
+});
+test('toExactArrayBuffer preserves a subarray view of a larger buffer', () => {
+  const backing = new Uint8Array(64);
+  const query = makeQuery('slice-view.example');
+  backing.set(query, 17); // non-zero offset inside a larger backing buffer
+  const buffer = __internals.toExactArrayBuffer(backing.subarray(17, 17 + query.length));
+  assert.equal(buffer.byteLength, query.length);
+  assert.deepEqual(Array.from(new Uint8Array(buffer)), Array.from(query));
+  // A full-span view keeps its original buffer without copying.
+  const whole = new Uint8Array(8);
+  assert.equal(__internals.toExactArrayBuffer(whole), whole.buffer);
+});
+test('readCappedBody keeps exact boundaries when a stream yields a single subarray chunk', async () => {
+  const backing = new Uint8Array(256);
+  const query = makeQuery('chunk-slice.example');
+  backing.set(query, 40);
+  const stream = new ReadableStream({
+    start(controller) {
+      controller.enqueue(backing.subarray(40, 40 + query.length));
+      controller.close();
+    }
+  });
+  const chunk = await __internals.readCappedBody({ body: stream }, 4096, 'too large');
+  const exact = __internals.toExactArrayBuffer(chunk);
+  assert.equal(exact.byteLength, query.length);
+  assert.deepEqual(Array.from(new Uint8Array(exact)), Array.from(query));
+});
+test('upstream fetch pins the redirect policy to error', async () => {
+  await withGlobalRuntimeMocks(async () => {
+    const res = await postQuery('redirect-policy.example', 'redirect-test');
+    assert.equal(res.status, 502);
+  }, {
+    fetch: async (_url, init) => {
+      assert.equal(init.redirect, 'error');
+      throw new Error('unreachable upstream');
+    },
+    caches: cacheMock()
+  });
+});
+test('L2 entries with a corrupt DNS body are purged and re-resolved upstream', async () => {
+  const key = await __internals.makeCacheKey(makeQuery('l2-corrupt.example'));
+  let purged = false;
+  let upstreamCalls = 0;
+  await withGlobalRuntimeMocks(async () => {
+    const res = await postQuery('l2-corrupt.example', 'l2-corrupt-test');
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('x-cache'), 'MISS');
+    assert.equal(upstreamCalls, 1);
+    assert.equal(purged, true);
+  }, {
+    fetch: async (_url, init) => {
+      upstreamCalls += 1;
+      return new Response(makeAResponse(init.body, 60), {
+        status: 200,
+        headers: { 'content-type': 'application/dns-message' }
+      });
+    },
+    caches: {
+      default: {
+        match: async (req) => (req.url.endsWith(key)
+          ? new Response(new Uint8Array([1, 2, 3, 4, 5, 6]), {
+            headers: { 'x-doh-stored-at': String(Date.now()), 'x-doh-ttl': '300' }
+          })
+          : null),
+        put: async () => {},
+        delete: async () => { purged = true; }
+      }
+    }
+  });
+});
+test('L2 entries echoing a different question are purged and re-resolved', async () => {
+  const key = await __internals.makeCacheKey(makeQuery('l2-mismatch.example'));
+  let purged = false;
+  const foreign = makeAResponse(makeQuery('foreign.example'), 60).buffer;
+  await withGlobalRuntimeMocks(async () => {
+    const res = await postQuery('l2-mismatch.example', 'l2-mismatch-test');
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('x-cache'), 'MISS');
+    assert.equal(purged, true);
+  }, {
+    fetch: async (_url, init) => new Response(makeAResponse(init.body, 60), {
+      status: 200,
+      headers: { 'content-type': 'application/dns-message' }
+    }),
+    caches: {
+      default: {
+        match: async (req) => (req.url.endsWith(key)
+          ? new Response(foreign, {
+            headers: { 'x-doh-stored-at': String(Date.now()), 'x-doh-ttl': '300' }
+          })
+          : null),
+        put: async () => {},
+        delete: async () => { purged = true; }
+      }
+    }
+  });
+});
+test('getDNSCacheTTL ignores SOA records with trailing or missing bytes', () => {
+  const query = makeQuery('soa-trailing.example');
+  const q = query.length;
+  const valid = makeNxdomainWithSOA(query, 300, 45);
+  assert.equal(__internals.getDNSCacheTTL(valid), 45);
+  const padded = new Uint8Array(valid.length + 2);
+  padded.set(valid, 0);
+  padded[q + 11] = 30; // rdlength 28 -> 30, leaving 2 trailing garbage bytes
+  assert.equal(__internals.getDNSCacheTTL(padded), 0);
+  const short = Array.from(valid);
+  short[q + 11] = 26; // rdlength cuts into the MINIMUM field itself
+  assert.equal(__internals.getDNSCacheTTL(new Uint8Array(short)), 0);
+});
+function makeTruncatedResponse(query, rcode = 0) {
+  const bytes = Array.from(query);
+  bytes[2] = 0x81;
+  bytes[3] = 0x80 | 0x02 | (rcode & 0x0f); // QR | TC | RCODE
+  return new Uint8Array(bytes);
+}
+test('truncated upstream answers lose the race to complete ones', async () => {
+  await withGlobalRuntimeMocks(async () => {
+    const res = await postQuery('truncate.example', 'truncate-test');
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('x-dns-degraded'), null);
+    const body = new Uint8Array(await res.arrayBuffer());
+    assert.equal(body[3] & 0x02, 0); // the winning answer has TC clear
+  }, {
+    fetch: async (url) => {
+      if (url.includes('root.hagezi')) {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        return new Response(makeTruncatedResponse(makeQuery('truncate.example')), {
+          status: 200,
+          headers: { 'content-type': 'application/dns-message' }
+        });
+      }
+      return new Response(makeAResponse(makeQuery('truncate.example'), 60), {
+        status: 200,
+        headers: { 'content-type': 'application/dns-message' }
+      });
+    },
+    caches: cacheMock()
+  });
+});
+test('all-truncated upstreams return a degraded answer without caching it', async () => {
+  await withGlobalRuntimeMocks(async () => {
+    const first = await postQuery('truncate-all.example', 'truncate-all-test');
+    assert.equal(first.status, 200);
+    assert.equal(first.headers.get('x-dns-degraded'), '1');
+    const second = await postQuery('truncate-all.example', 'truncate-all-test');
+    assert.equal(second.headers.get('x-cache'), 'MISS');
+  }, {
+    fetch: async (_url, init) => new Response(makeTruncatedResponse(init.body), {
+      status: 200,
+      headers: { 'content-type': 'application/dns-message' }
+    }),
+    caches: cacheMock()
+  });
 });

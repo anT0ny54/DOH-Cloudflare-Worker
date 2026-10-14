@@ -29,7 +29,7 @@ This Worker deliberately stays far below those ceilings on ordinary DNS traffic:
 | Cold cache miss | 1 match + 1 async put (only if the answer is cacheable) | normally 1 |
 | Slow/failing recovery | 1 match + 1 async put (only if the answer is cacheable) | at most 3 |
 
-The resolver logic never launches all three upstreams immediately. In-flight duplicate work is bounded at 128 entries, and upstream response buffering is capped at 65,535 bytes to reduce worst-case memory pressure. It starts with one learned/rotated HaGeZi endpoint, hedges to a backup only when latency or failure justifies it, and uses the third endpoint only as last-resort recovery. Maximum concurrent upstream connections from this Worker are therefore 3, below Cloudflare's limit of 6.
+The resolver logic never launches all three upstreams immediately. In-flight duplicate work is bounded at 128 entries: the in-flight entry for a cache key is registered synchronously before the L2 lookup, so concurrent cold-cache misses for the same question coalesce onto a single upstream job instead of each spawning duplicate subrequests. Upstream response buffering is capped at 65,535 bytes to reduce worst-case memory pressure. It starts with one learned/rotated HaGeZi endpoint, hedges to a backup only when latency or failure justifies it, and uses the third endpoint only as last-resort recovery. Maximum concurrent upstream connections from this Worker are therefore 3, below Cloudflare's limit of 6.
 
 #### Resolver selection and hedging
 
@@ -48,13 +48,13 @@ The Cache API is data-center-local and does not replicate entries automatically 
 
 Both DoH GET and POST requests use the same cache key: the first 128 bits of the SHA-256 of the DNS wire query, with only the transaction ID normalized (all EDNS options, flags and the question type/class remain part of the key, so clients that add a per-query EDNS cookie or variable-length padding produce different keys and get fewer cache hits). ASCII QNAME case is also normalized (question names are always uncompressed here, because queries with a compressed question name are rejected before the cache key is computed), so `example.com`, `EXAMPLE.com`, and mixed-case variants can share a cache entry. Therefore the same DNS question can share a cache entry across GET and POST. When a cached answer is served, the question section is rewritten to the exact letter case the requesting client sent, so DNS 0x20-style case randomization still validates.
 
-Only DNS answers that are safe to reuse are cached: `NOERROR` and `NXDOMAIN` responses that are not truncated (TC) and are at most 65,535 bytes. Negative answers (`NXDOMAIN`/`NODATA`) are cached only when they carry an SOA record; the TTL is the smaller of the lowest authority-section record TTL (which includes the SOA TTL) and the SOA `MINIMUM` field, per RFC 2308. Record TTLs with the top bit set are treated as 0 (RFC 2181), so such answers are not cached. `SERVFAIL`, `REFUSED` and similar responses are relayed to the client (marked `x-dns-degraded: 1`) but never cached.
+Only DNS answers that are safe to reuse are cached: `NOERROR` and `NXDOMAIN` responses that are not truncated (TC) and are at most 65,535 bytes. Negative answers (`NXDOMAIN`/`NODATA`) are cached only when they carry an SOA record; the TTL is the smaller of the lowest authority-section record TTL (which includes the SOA TTL) and the SOA `MINIMUM` field, per RFC 2308. Record TTLs with the top bit set are treated as 0 (RFC 2181), so such answers are not cached; the SOA `MINIMUM` field gets the same treatment. For positive (`NOERROR`) answers the cache TTL is the minimum across all sections present in the response (answer, authority and additional, excluding OPT), not just the answer section, so a short-lived authority record cannot be over-cached. `SERVFAIL`, `REFUSED` and similar responses are relayed to the client (marked `x-dns-degraded: 1`) but never cached.
 
-Responses cached internally use DNS TTL-derived expiration. The response transaction ID is rewritten for each client, and cached DNS record TTLs are reduced by cache age before being returned. `Cache-Control: no-store` remains on the client-facing response so the Worker controls the DNS cache instead of creating an uncontrolled browser/HTTP cache layer.
+Responses cached internally use DNS TTL-derived expiration. The response transaction ID is rewritten for each client, and cached DNS record TTLs are reduced by cache age before being returned. An L2 hit also refreshes the edge entry (re-`put` with its remaining TTL), so hot keys do not lapse into avoidable re-resolutions as their TTL runs down. `Cache-Control: no-store` remains on the client-facing response so the Worker controls the DNS cache instead of creating an uncontrolled browser/HTTP cache layer.
 
 ### Rate limiting
 
-`/dns-query` is limited to **100 requests per 60 seconds per client IP** through the native `DNS_RATE_LIMITER` binding in `wrangler.toml` (Cloudflare only accepts a period of 10 or 60 seconds). The check runs before the method, size and format checks, so rejected or malformed requests also count against the limit; `/health` and the dashboard are not rate limited. A lightweight per-isolate fallback limiter (fixed 60 s window, 100 requests per IP, at most 2048 tracked IPs, least-recently-used eviction) is used when the binding is missing, throws, or returns an invalid response (the request is then limited locally rather than rejected or allowed unconditionally). The client IP is taken from `CF-Connecting-IP`; requests without it share one `unknown` bucket. Cloudflare documents the native Rate Limiting API as low-latency; its counters are scoped to the relevant Cloudflare location rather than being one globally exact counter.
+`/dns-query` is limited to **100 requests per 60 seconds per client IP** through the native `DNS_RATE_LIMITER` binding in `wrangler.toml` (Cloudflare only accepts a period of 10 or 60 seconds). The check runs before the method, size and format checks, so rejected or malformed requests also count against the limit; `/health` and the dashboard are not rate limited. A lightweight per-isolate fallback limiter (fixed 60 s window, 100 requests per IP, at most 2048 tracked IPs, least-recently-used eviction) is used when the binding is missing, throws, or returns an invalid response (the request is then limited locally rather than rejected or allowed unconditionally). Two details matter for the fallback path: requests rejected as over-limit do **not** refresh their entry's LRU position, so a flooding client cannot keep itself hot in the table and evict legitimate IPs; and windows evicted by a table overflow are retained in a small (256-entry) penalty map, so flooding the table (e.g. by rotating IPv6 addresses within a /64) cannot hand a client a fresh 100-request window. The client IP is taken from `CF-Connecting-IP`; requests without it share one `unknown` bucket. Cloudflare documents the native Rate Limiting API as low-latency; its counters are scoped to the relevant Cloudflare location rather than being one globally exact counter.
 
 ### Request-size protection
 
@@ -86,7 +86,7 @@ https://YOUR-DOMAIN.example/dns-query
 |---|---|
 | `/dns-query` | DoH endpoint (GET and POST), rate limited |
 | `/health` | JSON status: version, resolver scores, cache/in-flight/throttle counters, limits |
-| `/`, `/index.html` | Setup dashboard (EN / FA / ZH). It loads the Tailwind Play CDN script from `cdn.tailwindcss.com`; the DoH endpoint itself does not depend on it. Served with a restrictive Content-Security-Policy that includes `frame-ancestors 'none'`, so the page cannot be embedded in a frame |
+| `/`, `/index.html` | Setup dashboard (EN / FA / ZH). Its Tailwind utilities are pre-compiled and inlined in a `<style>` block (no external CDN dependency); the DoH endpoint itself does not depend on it. Served with a restrictive Content-Security-Policy that includes `frame-ancestors 'none'`, so the page cannot be embedded in a frame |
 | anything else | `404` |
 
 `/dns-query` status codes: `200` DNS message, `400` malformed query (including a compressed question name) or missing `dns` parameter, `405` method other than GET/POST, `413` message larger than 4 KiB (or a GET `dns` parameter longer than 5,462 characters), `415` POST without `application/dns-message`, `429` rate limit exceeded (`Retry-After: 60`), `502` all upstreams failed (the `x-upstreams` header counts the attempts made by *this* request: a request that joined another request's failed in-flight resolution reports `0`). The rate-limit check runs first, so a client over the limit receives `429` even when its request would otherwise have been a `405`, `400` or `413`.
@@ -125,13 +125,13 @@ https://dns.yourdomain.com/dns-query
 
 ### Unit tests
 
-Run the included Node.js unit tests from the project folder. Use Node.js 22.7 or newer (developed and tested on v22; module-syntax detection is enabled by default from 22.7); `Worker.js` is an ES module without a `package.json`, so Node must auto-detect module syntax.
+Run the included Node.js unit tests from the project folder. Use Node.js 22.7 or newer (developed and tested on v22; module-syntax detection is enabled by default from 22.7). The project ships a minimal `package.json` with `"type": "module"`, so the module type is explicit and older Node versions or bundlers do not have to auto-detect it.
 
 ```bash
-node --test test.mjs
+npm test        # or: node --test
 ```
 
-The suite (42 tests) mocks `fetch` and the Cache API, so it needs no network or Cloudflare account.
+The suite (47 tests) mocks `fetch` and the Cache API, so it needs no network or Cloudflare account.
 
 ### Verifying a deployment
 
@@ -172,19 +172,24 @@ This is **DNS encryption**, not a VPN. It protects DNS traffic between the clien
 
 Based on [Secure DNS over HTTPS Cloudflare Worker](https://github.com/TheGreatAzizi/Secure-DNS-over-HTTPS-Cloudflare-Worker) by M.M.Azizi (MIT).
 
-## 🌐 Free DNS Services
+## 🔗 Related projects (not part of this repository)
+
+The services below are maintained separately and are **not** part of this repository, its build pipeline, or its release cycle. They are listed here for convenience only.
+
+### 🌐 Free DNS Services
 
 High-performance DNS utilizing HaGeZi Blocklists (Multi Pro + TIF).
 
 | Blocklist | DNS-over-HTTPS (DoH) |
 | :--- | :--- |
 | Multi Pro + TIF | `https://freedns.koyeb.app/dns-query` (Recommended) |
+| Multi Pro + TIF | `https://dns.mydoh.workers.dev/dns-query` (Recommended) |
 | Multi Pro + TIF | `https://dns-pi.vercel.app/api/doh/dns-query` (Recommended) |
 | Multi Pro + TIF | `https://dnssix.netlify.app/api/doh/dns-query` |
-| Multi Pro + TIF | `https://dns-93aca.containers.snapdeploy.app/dns-query` (Recommended, but will sleep if not used in 15 minutes) |
-| Multi Pro + TIF | `https://doh-93aca.containers.snapdeploy.app/dns-query` (Recommended, but will sleep if not used in 15 minutes) |
+| Multi Pro + TIF | `https://dns-93aca.containers.snapdeploy.app/dns-query` |
+| Multi Pro + TIF | `https://doh-93aca.containers.snapdeploy.app/dns-query` |
 
-## ⚡ Bandwidth Hero Server
+### ⚡ Bandwidth Hero Server
 
 A lightweight image optimization proxy designed to slash bandwidth usage and accelerate web browsing.
 

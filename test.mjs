@@ -1,6 +1,8 @@
-import test from 'node:test';
+import test, { beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import worker, { __internals } from './Worker.js';
+// Resolver state is module-level and shared between tests in this file.
+beforeEach(() => { __internals.resetResolverState(); });
 function makeQuery(name, id = 0x1234, flags = 0x0100) {
   const labels = name === '.' ? [] : name.split('.');
   const bytes = [
@@ -305,7 +307,7 @@ test('coalesced degraded results propagate x-dns-degraded', async () => {
 test('health reports version and sweep interval', async () => {
   const res = await worker.fetch(new Request('https://workers.example/health'), {}, {});
   const body = await res.json();
-  assert.equal(body.version, '0.2.8');
+  assert.equal(body.version, '0.2.9');
   assert.equal(body.stateSweepIntervalSeconds, 60);
 });
 test('DNS name wire length boundary is enforced', () => {
@@ -459,9 +461,18 @@ test('requests joining a failed in-flight resolution get a 502, not an exception
   const gate = new Promise((resolve) => { releaseUpstream = resolve; });
   await withGlobalRuntimeMocks(async () => {
     const first = postQuery('joinfail.example', 'join-fail');
-    await new Promise((resolve) => setImmediate(resolve));
+    // Wait until the leader has registered its inflight entry (its digest is
+    // async, so a bare setImmediate is not enough on every Node version).
+    const joinKey = await __internals.makeCacheKey(makeQuery('joinfail.example'));
+    for (let i = 0; i < 100 && !__internals.hasInflight(joinKey); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(__internals.hasInflight(joinKey), true);
     const second = postQuery('joinfail.example', 'join-fail');
-    await new Promise((resolve) => setImmediate(resolve));
+    // Give the joiner time to finish its async parse/digest and attach to the
+    // leader's inflight job before releasing the upstream gate (a single
+    // setImmediate is not enough on every Node version).
+    await new Promise((resolve) => setTimeout(resolve, 25));
     releaseUpstream();
     const results = await Promise.allSettled([first, second]);
     for (const r of results) {
@@ -478,7 +489,7 @@ test('requests joining a failed in-flight resolution get a 502, not an exception
 test('L2 hit older than the L1 cap is still promoted to L1', async () => {
   const query = makeQuery('promote.example');
   const key = await __internals.makeCacheKey(query);
-  const body = __internals.normalizeDNSResponseID(makeAResponse(query, 3600).buffer);
+  const body = makeAResponse(query, 3600).buffer;
   const storedAt = Date.now() - 400_000; 
   await withGlobalRuntimeMocks(async () => {
     const first = await postQuery('promote.example', 'promote-test');
@@ -527,14 +538,18 @@ test('localRateLimit allows 100 requests per window then blocks', () => {
   }
   assert.equal(__internals.localRateLimit(ip), false);
 });
-test('localRateLimit keeps a busy client when new keys flood the table', () => {
+test('localRateLimit survives a table-overflow flood without a fresh window', () => {
   const busy = 'lru-busy-client';
-  for (let i = 0; i < 99; i++) __internals.localRateLimit(busy);
+  for (let i = 0; i < __internals.CONFIG.RATE_LIMIT_MAX_REQUESTS; i++) {
+    assert.equal(__internals.localRateLimit(busy), true);
+  }
+  assert.equal(__internals.localRateLimit(busy), false);
   const max = __internals.CONFIG.MAX_THROTTLE_ENTRIES;
   for (let i = 0; i < max + 10; i++) {
     __internals.localRateLimit(`lru-filler-${i}`);
-    if (i % 500 === 0) __internals.localRateLimit(busy); 
   }
+  // The flood evicted `busy` from the main table, but its window survives in
+  // the penalty map: it must NOT get a fresh 100-request window.
   assert.equal(__internals.localRateLimit(busy), false);
 });
 test('L1 is re-checked after an L2 miss so a concurrently filled entry avoids an upstream call', async () => {
@@ -547,7 +562,7 @@ test('L1 is re-checked after an L2 miss so a concurrently filled entry avoids an
     const slow = postQuery('l1recheck.example', 'l1-recheck');
     await new Promise((resolve) => setImmediate(resolve));
     const key = await __internals.makeCacheKey(query);
-    __internals.setCache(key, __internals.normalizeDNSResponseID(makeAResponse(query, 100).buffer), 100);
+    __internals.setCache(key, makeAResponse(query, 100).buffer, 100);
     releaseL2();
     const res = await slow;
     assert.equal(res.status, 200);
@@ -620,9 +635,114 @@ test('hedging: the slower attempt is aborted once another resolver answers and i
     caches: cacheMock()
   });
 });
+test('concurrent cold-cache misses coalesce into a single upstream job', async () => {
+  let calls = 0;
+  let releaseUpstream;
+  const gate = new Promise((resolve) => { releaseUpstream = resolve; });
+  await withGlobalRuntimeMocks(async () => {
+    const pending = Promise.all([
+      postQuery('race.example', 'race-1'),
+      postQuery('race.example', 'race-2'),
+      postQuery('race.example', 'race-3')
+    ]);
+    // Hold the upstream open until all three requests arrived, so the two
+    // joiners must attach to the leader's inflight job (an instant mock would
+    // let them observe the filled L1 instead).
+    for (let i = 0; i < 100 && calls === 0; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    assert.equal(calls, 1);
+    releaseUpstream();
+    const results = await pending;
+    for (const res of results) assert.equal(res.status, 200);
+    const tags = results.map((r) => r.headers.get('x-cache'));
+    assert.equal(tags.filter((tag) => tag === 'MISS').length, 1);
+    assert.equal(tags.filter((tag) => tag === 'COALESCED').length, 2);
+    // One coalesced job with a healthy first resolver = exactly one upstream
+    // call, not three jobs x up-to-three attempts each.
+    assert.equal(calls, 1);
+  }, {
+    fetch: async (_url, init) => {
+      calls += 1;
+      await gate;
+      return new Response(makeAResponse(init.body, 60), {
+        status: 200,
+        headers: { 'content-type': 'application/dns-message' }
+      });
+    },
+    caches: cacheMock()
+  });
+});
+test('getDNSCacheTTL treats SOA MINIMUM with the MSB set as zero (RFC 2181)', () => {
+  const query = makeQuery('soamsb.example');
+  assert.equal(__internals.getDNSCacheTTL(makeNxdomainWithSOA(query, 300, 0x80000000)), 0);
+});
+function makeAWithAuthority(query, answerTtl, authorityTtl) {
+  const bytes = Array.from(makeAResponse(query, answerTtl));
+  bytes[9] = 1; // nscount = 1 (an NS record in the authority section)
+  const u32 = (v) => [(v >>> 24) & 0xff, (v >>> 16) & 0xff, (v >>> 8) & 0xff, v & 0xff];
+  bytes.push(0xc0, 0x0c, 0, 2, 0, 1, ...u32(authorityTtl), 0, 0);
+  return new Uint8Array(bytes);
+}
+test('getDNSCacheTTL uses the minimum TTL across all sections for positive answers', () => {
+  const response = makeAWithAuthority(makeQuery('multi.example'), 100, 30);
+  assert.equal(__internals.getDNSCacheTTL(response), 30);
+});
+test('corrupt L2 entries are purged instead of being re-read forever', async () => {
+  const query = makeQuery('corrupt.example');
+  const key = await __internals.makeCacheKey(query);
+  let matches = 0;
+  let deletes = 0;
+  await withGlobalRuntimeMocks(async () => {
+    await postQuery('corrupt.example', 'corrupt-test');
+    await postQuery('corrupt.example', 'corrupt-test');
+    assert.equal(matches, 2);
+    assert.equal(deletes, 1);
+  }, {
+    fetch: async () => { throw new Error('upstream must not be used'); },
+    caches: {
+      default: {
+        match: async (req) => {
+          if (!req.url.endsWith(key)) return null;
+          matches += 1;
+          if (matches > 1) return null;
+          // Body is fine but the bookkeeping headers are missing: corrupt.
+          return new Response(makeAResponse(query, 100).buffer);
+        },
+        delete: async () => { deletes += 1; },
+        put: async () => {}
+      }
+    }
+  });
+});
+test('an L2 hit refreshes the edge entry so hot keys keep their lifetime', async () => {
+  const query = makeQuery('refresh.example');
+  const key = await __internals.makeCacheKey(query);
+  const storedAt = Date.now() - 100_000; // 100 seconds ago
+  const puts = [];
+  await withGlobalRuntimeMocks(async () => {
+    const ctx = { waitUntil: (promise) => promise };
+    const res = await postQuery('refresh.example', 'refresh-test', ctx);
+    assert.equal(res.headers.get('x-cache'), 'L2-HIT');
+    assert.equal(puts.length, 1);
+    assert.equal(puts[0].headers.get('x-doh-ttl'), '3500');
+  }, {
+    fetch: async () => { throw new Error('upstream must not be used'); },
+    caches: {
+      default: {
+        match: async (req) => (req.url.endsWith(key)
+          ? new Response(makeAResponse(query, 3600).buffer, {
+            headers: { 'x-doh-stored-at': String(storedAt), 'x-doh-ttl': '3600' }
+          })
+          : null),
+        put: async (_req, res) => { puts.push(res); }
+      }
+    }
+  });
+});
 test('dashboard forbids framing and is served with a restrictive CSP', async () => {
   const res = await worker.fetch(new Request('https://workers.example/'), {}, {});
   assert.equal(res.status, 200);
   assert.match(res.headers.get('content-security-policy'), /frame-ancestors 'none'/);
-  assert.match(await res.text(), /v0\.2\.8/);
+  assert.match(await res.text(), /v0\.2\.9/);
 });

@@ -1,0 +1,9 @@
+{
+  "name": "doh-cloudflare-worker",
+  "version": "0.2.9",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  }
+}

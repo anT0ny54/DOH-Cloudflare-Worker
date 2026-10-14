@@ -1,4 +1,4 @@
-const VERSION = '0.2.8';
+const VERSION = '0.2.9';
 const CONFIG = {
   DNS_PATH: '/dns-query',
   EDGE_CACHE_ENABLED: true,
@@ -11,8 +11,8 @@ const CONFIG = {
   RATE_LIMIT_WINDOW_MS: 60_000,
   RATE_LIMIT_MAX_REQUESTS: 100,
   MAX_THROTTLE_ENTRIES: 2048,
+  MAX_PENALTY_ENTRIES: 256,
   STATE_SWEEP_INTERVAL_MS: 60_000,
-  INFLIGHT_STALE_MS: 10_000,
   MAX_DNS_MESSAGE_BYTES: 4096,
   MAX_GET_DNS_CHARS: 5462,
   MAX_UPSTREAM_DNS_MESSAGE_BYTES: 65_535,
@@ -46,15 +46,16 @@ const RESOLVER_NODES = HAGEZI_UPSTREAMS.map((url, order) => ({
 const APP_STATE = {
   cache: new Map(),
   throttle: new Map(),
+  penalty: new Map(),
   inflight: new Map(),
   primaryCursor: 0,
   lastSweepAt: 0
 };
 export default {
   async fetch(req, env, ctx) {
-    maybeSweepState();
     const url = new URL(req.url);
     if (url.pathname === CONFIG.DNS_PATH) {
+      maybeSweepState();
       if (!(await allowDNSRequest(getClientIP(req), env))) {
         return textResponse('Rate limit exceeded', 429, {
           'cache-control': 'no-store',
@@ -64,6 +65,7 @@ export default {
       return handleDNS(req, url, ctx);
     }
     if (url.pathname === '/health') {
+      maybeSweepState();
       return jsonResponse(getHealthSnapshot(), 200, {
         'cache-control': 'no-store'
       });
@@ -94,76 +96,123 @@ async function handleDNS(req, url, ctx) {
   if (localHit) return l1Response(localHit, parsed.id, payload);
   const existing = APP_STATE.inflight.get(cacheKey);
   if (existing) return awaitCoalesced(existing, parsed, payload);
-  if (CONFIG.EDGE_CACHE_ENABLED) {
-    const edgeHit = await getEdgeCache(cacheKey, parsed.id, url.origin, payload);
-    if (!edgeHit) {
-      const filled = getCache(cacheKey);
-      if (filled) return l1Response(filled, parsed.id, payload);
-    } else {
-      setCache(
-        cacheKey,
-        edgeHit.body,
-        Math.min(edgeHit.remainingSeconds, CONFIG.LOCAL_CACHE_MAX_TTL_SECONDS),
-        edgeHit.storedAt
-      );
-      return dnsResponse(edgeHit.responseBody, {
-        'x-cache': 'L2-HIT',
-        'x-edge-cache': 'HIT',
-        'x-upstreams': '0'
-      });
-    }
-  }
-  const raced = APP_STATE.inflight.get(cacheKey);
-  if (raced) return awaitCoalesced(raced, parsed, payload);
-  const resolvers = selectRacers(RESOLVER_NODES);
-  const job = (async () => {
-    const result = await resolveWithHedging(resolvers, payload, parsed.id);
-    const storedAt = Date.now();
-    const ttlSeconds = getDNSCacheTTL(result.body);
-    let normalizedBody = result.body;
-    if (ttlSeconds > 0) {
-      normalizedBody = normalizeDNSResponseID(result.body);
-      setCache(
-        cacheKey,
-        normalizedBody,
-        Math.min(ttlSeconds, CONFIG.LOCAL_CACHE_MAX_TTL_SECONDS),
-        storedAt
-      );
-      if (CONFIG.EDGE_CACHE_ENABLED) {
-        try {
-          ctx?.waitUntil?.(putEdgeCache(
-            cacheKey,
-            normalizedBody,
-            ttlSeconds,
-            storedAt,
-            url.origin
-          ));
-        } catch (_) {}
-      }
-    }
-    return {
-      ...result,
-      body: normalizedBody,
-      storedAt
-    };
-  })();
-  job.startedAt = Date.now();
+  // Register synchronously in the inflight map *before* the async L2 lookup so
+  // concurrent cold-cache misses coalesce onto this entry. Registering after
+  // the L2 check let two simultaneous misses both pass the check and each
+  // create their own upstream job (duplicate subrequests, doubled load).
+  let settleJob;
+  const job = new Promise((resolve, reject) => { settleJob = { resolve, reject }; });
+  // A failed job with no joiners must not surface as an unhandled rejection;
+  // joiners awaiting `job` still receive the rejection normally.
+  job.catch(() => {});
   APP_STATE.inflight.set(cacheKey, job);
   trimMap(APP_STATE.inflight, CONFIG.MAX_INFLIGHT_ENTRIES);
   try {
-    const result = await job;
-    const responseBody = patchDNSResponseForAge(result.body, parsed.id, 0, payload);
-    const headers = {
-      'x-cache': 'MISS',
-      'x-edge-cache': CONFIG.EDGE_CACHE_ENABLED ? 'MISS' : 'DISABLED',
-      'x-upstreams': String(result.attempts),
-      'x-winner': sanitizeHeaderValue(result.url),
-      'x-winner-lat': `${result.latencyMs}ms`
-    };
-    if (result.degraded) headers['x-dns-degraded'] = '1';
-    return dnsResponse(responseBody, headers);
-  } catch (err) {
-    return upstreamFailureResponse(err?.attempts ?? resolvers.length);
+    let shared = null;
+    let response = null;
+    if (CONFIG.EDGE_CACHE_ENABLED) {
+      const edgeHit = await getEdgeCache(cacheKey, parsed.id, url.origin, payload);
+      if (edgeHit) {
+        setCache(
+          cacheKey,
+          edgeHit.body,
+          Math.min(edgeHit.remainingSeconds, CONFIG.LOCAL_CACHE_MAX_TTL_SECONDS),
+          edgeHit.storedAt
+        );
+        // Refresh the edge entry on hit so hot keys keep their remaining
+        // lifetime instead of lapsing into a re-resolution near expiry.
+        ctx?.waitUntil?.(putEdgeCache(
+          cacheKey,
+          edgeHit.body,
+          edgeHit.remainingSeconds,
+          Date.now(),
+          url.origin
+        ));
+        shared = {
+          body: edgeHit.body,
+          storedAt: edgeHit.storedAt,
+          url: null,
+          latencyMs: 0,
+          degraded: false
+        };
+        response = dnsResponse(edgeHit.responseBody, {
+          'x-cache': 'L2-HIT',
+          'x-edge-cache': 'HIT',
+          'x-upstreams': '0'
+        });
+      }
+    }
+    if (!response) {
+      // L1 may have been filled by a concurrent request while the L2 lookup
+      // was in flight.
+      const filled = getCache(cacheKey);
+      if (filled) {
+        shared = {
+          body: filled.body,
+          storedAt: filled.storedAt,
+          url: null,
+          latencyMs: 0,
+          degraded: false
+        };
+        response = l1Response(filled, parsed.id, payload);
+      }
+    }
+    if (!response) {
+      const resolvers = selectRacers(RESOLVER_NODES);
+      try {
+        const result = await resolveWithHedging(resolvers, payload, parsed.id);
+        const storedAt = Date.now();
+        const ttlSeconds = getDNSCacheTTL(result.body);
+        // The stored body keeps the winning upstream's transaction ID; it is
+        // rewritten per request in patchDNSResponseForAge. This removes the
+        // old normalize-then-patch double copy on the miss path entirely.
+        if (ttlSeconds > 0) {
+          setCache(
+            cacheKey,
+            result.body,
+            Math.min(ttlSeconds, CONFIG.LOCAL_CACHE_MAX_TTL_SECONDS),
+            storedAt
+          );
+          if (CONFIG.EDGE_CACHE_ENABLED) {
+            ctx?.waitUntil?.(putEdgeCache(
+              cacheKey,
+              result.body,
+              ttlSeconds,
+              storedAt,
+              url.origin
+            ));
+          }
+        }
+        shared = {
+          body: result.body,
+          storedAt,
+          url: result.url,
+          latencyMs: result.latencyMs,
+          degraded: result.degraded
+        };
+        const headers = {
+          'x-cache': 'MISS',
+          'x-edge-cache': CONFIG.EDGE_CACHE_ENABLED ? 'MISS' : 'DISABLED',
+          'x-upstreams': String(result.attempts),
+          'x-winner': sanitizeHeaderValue(result.url),
+          'x-winner-lat': `${result.latencyMs}ms`
+        };
+        if (result.degraded) headers['x-dns-degraded'] = '1';
+        // Fresh answer: the body already carries the correct ID and TTLs, so
+        // it can be returned without an extra copy. Only the client QNAME
+        // case (which upstreams need not echo, cf. 0x20) is restored, in
+        // place, on this private buffer.
+        restoreQuestionCase(new Uint8Array(result.body), payload);
+        response = dnsResponse(result.body, headers);
+      } catch (err) {
+        settleJob.reject(err);
+        // resolveWithHedging always attaches the real attempt count; 0 covers
+        // a pathological throw instead of reporting phantom attempts.
+        return upstreamFailureResponse(err?.attempts ?? 0);
+      }
+    }
+    settleJob.resolve(shared);
+    return response;
   } finally {
     if (APP_STATE.inflight.get(cacheKey) === job) APP_STATE.inflight.delete(cacheKey);
   }
@@ -195,10 +244,12 @@ function coalescedDNSResponse(shared, parsed, queryBytes) {
   const headers = {
     'x-cache': 'COALESCED',
     'x-edge-cache': 'SKIP',
-    'x-upstreams': '0',
-    'x-winner': sanitizeHeaderValue(shared.url),
-    'x-winner-lat': `${shared.latencyMs}ms`
+    'x-upstreams': '0'
   };
+  if (shared.url) {
+    headers['x-winner'] = sanitizeHeaderValue(shared.url);
+    headers['x-winner-lat'] = `${shared.latencyMs}ms`;
+  }
   if (shared.degraded) headers['x-dns-degraded'] = '1';
   return dnsResponse(responseBody, headers);
 }
@@ -266,7 +317,9 @@ async function readCappedBody(source, maxBytes, tooLargeMessage) {
   } finally {
     try { await reader.releaseLock(); } catch (_) {}
   }
-  if (chunks.length === 1) return new Uint8Array(chunks[0]);
+  // A lone chunk is already a fresh, unreferenced Uint8Array from the reader:
+  // return it directly instead of copying.
+  if (chunks.length === 1) return chunks[0];
   const out = new Uint8Array(total);
   let offset = 0;
   for (const chunk of chunks) {
@@ -315,22 +368,30 @@ function parseDNSQuestion(packet) {
   }
   return { ok: true, id };
 }
-function normalizeDNSResponseID(responseBuffer) {
-  const bytes = new Uint8Array(responseBuffer);
-  const copy = new Uint8Array(bytes.length);
-  copy.set(bytes);
-  copy[0] = 0;
-  copy[1] = 0;
-  return copy.buffer;
+let racerRankingCache = null;
+let racerRankingDirty = true;
+function invalidateRacerRanking() {
+  racerRankingDirty = true;
 }
 function selectRacers(resolvers) {
-  const ranked = [...resolvers].sort((a, b) => {
-    if (b.score !== a.score) return b.score - a.score;
-    const al = a.ewmaLatencyMs ?? Number.MAX_SAFE_INTEGER;
-    const bl = b.ewmaLatencyMs ?? Number.MAX_SAFE_INTEGER;
-    if (al !== bl) return al - bl;
-    return a.order - b.order;
-  });
+  // The ranking only changes when a resolver is rewarded/penalized, so it is
+  // cached and re-sorted only then (score/latency/order are the only inputs).
+  let ranked;
+  if (resolvers === RESOLVER_NODES && !racerRankingDirty) {
+    ranked = racerRankingCache;
+  } else {
+    ranked = [...resolvers].sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      const al = a.ewmaLatencyMs ?? Number.MAX_SAFE_INTEGER;
+      const bl = b.ewmaLatencyMs ?? Number.MAX_SAFE_INTEGER;
+      if (al !== bl) return al - bl;
+      return a.order - b.order;
+    });
+    if (resolvers === RESOLVER_NODES) {
+      racerRankingCache = ranked;
+      racerRankingDirty = false;
+    }
+  }
   const bestScore = ranked[0]?.score ?? 0;
   const pool = ranked.filter((node) => node.score >= bestScore - 8);
   if (pool.length <= 1) return ranked;
@@ -490,8 +551,8 @@ function validateDNSResponse(responseBuffer, expectedID) {
   const id = (bytes[0] << 8) | bytes[1];
   const flags = (bytes[2] << 8) | bytes[3];
   const rcode = flags & 0x000f;
-  if (id !== expectedID) return { ok: false, error: 'Upstream response ID mismatch' };
   if ((flags & 0x8000) === 0) return { ok: false, error: 'Upstream returned a DNS query, not response' };
+  if (id !== expectedID) return { ok: false, error: 'Upstream response ID mismatch' };
   return { ok: true, rcode };
 }
 function reward(node, latencyMs) {
@@ -502,11 +563,13 @@ function reward(node, latencyMs) {
     : Math.round(node.ewmaLatencyMs * 0.8 + latencyMs * 0.2);
   node.lastError = null;
   node.score = clamp(node.score + CONFIG.SCORE_SUCCESS_DELTA, CONFIG.SCORE_MIN, CONFIG.SCORE_MAX);
+  invalidateRacerRanking();
 }
 function penalize(node, amount, error, countFailure = true) {
   if (countFailure) node.fail += 1;
   node.lastError = String(error || 'unknown').slice(0, 80);
   node.score = clamp(node.score - amount, CONFIG.SCORE_MIN, CONFIG.SCORE_MAX);
+  invalidateRacerRanking();
 }
 function normalizeUncompressedQuestionName(bytes) {
   let offset = 12;
@@ -577,6 +640,7 @@ function getDNSCacheTTL(responseBuffer) {
   }
   let answerMin = Infinity;
   let authorityMin = Infinity;
+  let additionalMin = Infinity;
   let soaNegativeMin = Infinity;
   const sections = [
     ['answer', ancount],
@@ -596,9 +660,14 @@ function getDNSCacheTTL(responseBuffer) {
         if (rr.type === 6 && rr.rdLength >= 20) {
           const minimumOffset = findSOAMinimumOffset(bytes, rr.rdataOffset, rr.rdEnd);
           if (minimumOffset >= 0) {
-            soaNegativeMin = Math.min(soaNegativeMin, readUint32(bytes, minimumOffset));
+            // RFC 2181: a 32-bit interval with the MSB set means 0, consistent
+            // with how record TTLs are treated in readResourceRecord().
+            const minimum = readUint32(bytes, minimumOffset);
+            soaNegativeMin = Math.min(soaNegativeMin, minimum > 0x7fffffff ? 0 : minimum);
           }
         }
+      } else if (section === 'additional') {
+        additionalMin = Math.min(additionalMin, rr.ttl);
       }
     }
   }
@@ -606,7 +675,9 @@ function getDNSCacheTTL(responseBuffer) {
   if (rcode === 3 || (rcode === 0 && ancount === 0)) {
     ttl = soaNegativeMin === Infinity ? Infinity : Math.min(authorityMin, soaNegativeMin);
   } else {
-    ttl = answerMin;
+    // RFC-correct: minimum TTL across every section present (OPT records are
+    // already excluded), not just the answer section.
+    ttl = Math.min(answerMin, authorityMin, additionalMin);
   }
   if (!Number.isFinite(ttl) || ttl <= 0) return 0;
   return clamp(
@@ -726,10 +797,14 @@ async function getEdgeCache(key, queryID, origin, queryBytes) {
     const storedAt = Number(storedHeader);
     const ttlSeconds = Number(ttlHeader);
     if (!Number.isFinite(storedAt) || !Number.isFinite(ttlSeconds) || ttlSeconds <= 0) {
+      await purgeEdgeCache(cache, cacheKey);
       return null;
     }
     const ageSeconds = Math.max(0, Math.floor((Date.now() - storedAt) / 1000));
-    if (ageSeconds >= ttlSeconds) return null;
+    if (ageSeconds >= ttlSeconds) {
+      await purgeEdgeCache(cache, cacheKey);
+      return null;
+    }
     return {
       body,
       storedAt,
@@ -739,6 +814,11 @@ async function getEdgeCache(key, queryID, origin, queryBytes) {
   } catch (_) {
     return null;
   }
+}
+async function purgeEdgeCache(cache, cacheKey) {
+  // Best-effort: drop corrupt/expired entries so requests stop paying a
+  // cache.match + full body read until Cloudflare evicts them.
+  try { await cache.delete(cacheKey); } catch (_) {}
 }
 async function putEdgeCache(key, body, ttlSeconds, storedAt, origin) {
   try {
@@ -766,13 +846,8 @@ function maybeSweepState() {
   for (const [ip, stats] of APP_STATE.throttle) {
     if (now >= stats.resetAt) APP_STATE.throttle.delete(ip);
   }
-  // Drop inflight entries whose promise never settled. Jobs normally remove
-  // themselves in a finally block; this only guards the pathological case so
-  // a stuck entry cannot pin a cache key until trimMap eviction.
-  for (const [key, job] of APP_STATE.inflight) {
-    if (now - (job.startedAt || 0) >= CONFIG.INFLIGHT_STALE_MS) {
-      APP_STATE.inflight.delete(key);
-    }
+  for (const [ip, stats] of APP_STATE.penalty) {
+    if (now >= stats.resetAt) APP_STATE.penalty.delete(ip);
   }
   APP_STATE.lastSweepAt = now;
 }
@@ -790,16 +865,37 @@ async function allowDNSRequest(ip, env) {
 }
 function localRateLimit(ip) {
   const now = Date.now();
-  const current = APP_STATE.throttle.get(ip);
-  let stats = current || { count: 0, resetAt: now + CONFIG.RATE_LIMIT_WINDOW_MS };
-  if (now >= stats.resetAt) {
+  // Rejected requests must not re-touch the entry: a flooding client would
+  // otherwise stay hot in the LRU table and evict legitimate clients.
+  const live = APP_STATE.throttle.get(ip);
+  if (live && now < live.resetAt && live.count >= CONFIG.RATE_LIMIT_MAX_REQUESTS) {
+    return false;
+  }
+  // A window evicted by an LRU overflow survives in the penalty map, so
+  // flooding the table (e.g. IPv6 /64 scanning) cannot reset a client's count.
+  let stats = live || APP_STATE.penalty.get(ip);
+  if (!stats || now >= stats.resetAt) {
     stats = { count: 0, resetAt: now + CONFIG.RATE_LIMIT_WINDOW_MS };
   }
   stats.count += 1;
   APP_STATE.throttle.delete(ip);
   APP_STATE.throttle.set(ip, stats);
-  trimMap(APP_STATE.throttle, CONFIG.MAX_THROTTLE_ENTRIES);
+  trimThrottleMap();
   return stats.count <= CONFIG.RATE_LIMIT_MAX_REQUESTS;
+}
+function trimThrottleMap() {
+  while (APP_STATE.throttle.size > CONFIG.MAX_THROTTLE_ENTRIES) {
+    const oldestKey = APP_STATE.throttle.keys().next().value;
+    const stats = APP_STATE.throttle.get(oldestKey);
+    APP_STATE.throttle.delete(oldestKey);
+    if (stats && Date.now() < stats.resetAt) {
+      APP_STATE.penalty.delete(oldestKey);
+      APP_STATE.penalty.set(oldestKey, stats);
+      if (APP_STATE.penalty.size > CONFIG.MAX_PENALTY_ENTRIES) {
+        APP_STATE.penalty.delete(APP_STATE.penalty.keys().next().value);
+      }
+    }
+  }
 }
 function trimMap(map, maxEntries) {
   while (map.size > maxEntries) {
@@ -826,6 +922,7 @@ function getHealthSnapshot() {
     cacheEntries: APP_STATE.cache.size,
     inflightEntries: APP_STATE.inflight.size,
     throttleEntries: APP_STATE.throttle.size,
+    penaltyEntries: APP_STATE.penalty.size,
     rateLimit: {
       maxRequests: CONFIG.RATE_LIMIT_MAX_REQUESTS,
       windowSeconds: CONFIG.RATE_LIMIT_WINDOW_MS / 1000,
@@ -891,19 +988,34 @@ function escapeHtml(value) {
     "'": '&#39;'
   }[ch]));
 }
+function resetResolverState() {
+  // Test hook: tests within a file share RESOLVER_NODES, so score-sensitive
+  // tests reset it via beforeEach instead of snapshotting around mutations.
+  for (const node of RESOLVER_NODES) {
+    node.score = CONFIG.SCORE_START;
+    node.ok = 0;
+    node.fail = 0;
+    node.timeout = 0;
+    node.lastLatencyMs = null;
+    node.ewmaLatencyMs = null;
+    node.lastError = null;
+  }
+  invalidateRacerRanking();
+}
 export const __internals = {
   CONFIG,
   parseDNSQuestion,
   validateDNSResponse,
   decodeBase64Url,
   makeCacheKey,
-  normalizeDNSResponseID,
   getDNSCacheTTL,
   patchDNSResponseForAge,
   getHedgeDelay,
   localRateLimit,
   selectRacers,
-  setCache
+  setCache,
+  resetResolverState,
+  hasInflight: (key) => APP_STATE.inflight.has(key)
 };
 // The dashboard markup only differs per request in the endpoint URL, so the
 // ~15KB template is built once and cached at module scope.
@@ -921,7 +1033,74 @@ function buildUITemplate() {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Secure DNS over HTTPS (DoH) Pro</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🛡️</text></svg>">
-    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Pre-compiled Tailwind utilities: replaces the ~300KB CDN JIT script.
+           Only the classes used by this template are included. */
+        .fixed{position:fixed}.absolute{position:absolute}.relative{position:relative}
+        .right-0{right:0}.right-6{right:1.5rem}.top-6{top:1.5rem}.z-50{z-index:50}
+        .block{display:block}.hidden{display:none}
+        .flex{display:flex}.flex-col{flex-direction:column}.flex-wrap{flex-wrap:wrap}
+        .items-center{align-items:center}.justify-between{justify-content:space-between}.justify-center{justify-content:center}
+        .max-w-4xl{max-width:56rem}.min-h-\[300px\]{min-height:300px}.w-44{width:11rem}.w-full{width:100%}
+        .mx-auto{margin-left:auto;margin-right:auto}
+        .mb-1{margin-bottom:.25rem}.mb-4{margin-bottom:1rem}.mb-6{margin-bottom:1.5rem}.mb-8{margin-bottom:2rem}
+        .mb-10{margin-bottom:2.5rem}.mb-16{margin-bottom:4rem}.mb-20{margin-bottom:5rem}
+        .mt-3{margin-top:.75rem}.mt-8{margin-top:2rem}.mt-32{margin-top:8rem}.pb-20{padding-bottom:5rem}
+        .p-2{padding:.5rem}.p-3{padding:.75rem}.p-4{padding:1rem}.p-5{padding:1.25rem}
+        .p-8{padding:2rem}.p-10{padding:2.5rem}
+        .px-6{padding-left:1.5rem;padding-right:1.5rem}.px-12{padding-left:3rem;padding-right:3rem}
+        .py-3{padding-top:.75rem;padding-bottom:.75rem}.py-5{padding-top:1.25rem;padding-bottom:1.25rem}
+        .py-16{padding-top:4rem;padding-bottom:4rem}
+        .gap-3{gap:.75rem}.gap-4{gap:1rem}.gap-8{gap:2rem}.gap-10{gap:2.5rem}
+        .space-y-6>:not([hidden])~:not([hidden]){margin-top:1.5rem}
+        .list-none{list-style-type:none}
+        .rounded-2xl{border-radius:1rem}.rounded-xl{border-radius:.75rem}
+        .rounded-\[3rem\]{border-radius:3rem}.rounded-\[3.5rem\]{border-radius:3.5rem}
+        .border{border-width:1px}.border-t{border-top-width:1px}
+        .border-slate-800{border-color:#1e293b}.border-slate-900{border-color:#0f172a}
+        .border-sky-900\/40{border-color:rgba(12,74,110,.4)}.border-cyan-500\/20{border-color:rgba(6,182,212,.2)}
+        .bg-black\/40{background-color:rgba(0,0,0,.4)}.bg-cyan-600{background-color:#0891b2}
+        .from-cyan-400{--tw-gradient-from:#22d3ee;--tw-gradient-stops:var(--tw-gradient-from),var(--tw-gradient-to,rgba(186,230,253,0))}
+        .via-sky-300{--tw-gradient-stops:var(--tw-gradient-from),#bae6fd,var(--tw-gradient-to,rgba(52,211,153,0))}
+        .to-emerald-400{--tw-gradient-to:#34d399}
+        .bg-gradient-to-r{background-image:linear-gradient(to right,var(--tw-gradient-stops))}
+        .bg-clip-text{-webkit-background-clip:text;background-clip:text}.text-transparent{color:transparent}
+        .text-slate-400{color:#94a3b8}.text-slate-500{color:#64748b}
+        .text-cyan-100{color:#cffafe}.text-cyan-300{color:#67e8f9}.text-cyan-500{color:#06b6d4}.text-cyan-600{color:#0891b2}
+        .text-emerald-100{color:#d1fae5}.text-teal-100{color:#ccfbf1}.text-sky-400{color:#38bdf8}.text-black{color:#000}
+        .text-xs{font-size:.75rem;line-height:1rem}.text-sm{font-size:.875rem;line-height:1.25rem}
+        .text-base{font-size:1rem;line-height:1.5rem}.text-2xl{font-size:1.5rem;line-height:2rem}
+        .text-5xl{font-size:3rem;line-height:1}
+        .text-\[9px\]{font-size:9px}.text-\[10px\]{font-size:10px}.text-\[11px\]{font-size:11px}
+        .text-\[13px\]{font-size:13px}
+        .font-bold{font-weight:700}.font-black{font-weight:900}
+        .font-mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
+        .uppercase{text-transform:uppercase}.italic{font-style:italic}
+        .tracking-widest{letter-spacing:.1em}.tracking-\[0.3em\]{letter-spacing:.3em}
+        .leading-relaxed{line-height:1.625}.leading-loose{line-height:2}
+        .text-left{text-align:left}.text-right{text-align:right}.text-center{text-align:center}
+        .opacity-60{opacity:.6}
+        .shadow-xl{box-shadow:0 20px 25px -5px rgba(0,0,0,.1),0 8px 10px -6px rgba(0,0,0,.1)}
+        .shadow-2xl{box-shadow:0 25px 50px -12px rgba(0,0,0,.25)}
+        .shadow-inner{box-shadow:inset 0 2px 4px 0 rgba(0,0,0,.06)}
+        .transition-all{transition-property:all;transition-timing-function:cubic-bezier(.4,0,.2,1);transition-duration:.15s}
+        .outline-none{outline:2px solid transparent;outline-offset:2px}
+        .hover\:scale-105:hover{transform:scale(1.05)}
+        .active\:scale-95:active{transform:scale(.95)}
+        .hover\:bg-cyan-400:hover{background-color:#22d3ee}.hover\:bg-sky-600:hover{background-color:#0284c7}
+        .hover\:bg-emerald-600:hover{background-color:#059669}.hover\:bg-teal-600:hover{background-color:#0d9488}
+        .hover\:text-cyan-400:hover{color:#22d3ee}
+        .focus\:border-cyan-500\/50:focus{border-color:rgba(6,182,212,.5)}
+        @media(min-width:768px){
+            .md\:flex-row{flex-direction:row}
+            .md\:p-12{padding:3rem}.md\:p-14{padding:3.5rem}
+            .md\:py-24{padding-top:6rem;padding-bottom:6rem}
+            .md\:text-xs{font-size:.75rem;line-height:1rem}
+            .md\:text-lg{font-size:1.125rem;line-height:1.75rem}
+            .md\:text-7xl{font-size:4.5rem;line-height:1}
+            .md\:text-\[14px\]{font-size:14px}
+        }
+    </style>
     <style>
         body { background: #020617; color: #cbd5e1; font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; overflow-x: hidden; }
         .cyber-glass { background: rgba(15, 23, 42, 0.7); backdrop-filter: blur(15px); border: 1px solid rgba(0, 243, 255, 0.08); }
@@ -1117,7 +1296,7 @@ function renderUI(host) {
       'cache-control': 'public, max-age=300',
       'x-content-type-options': 'nosniff',
       'referrer-policy': 'no-referrer',
-      'content-security-policy': "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.tailwindcss.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+      'content-security-policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
     }
   });
 }

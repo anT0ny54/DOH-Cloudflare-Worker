@@ -1,6 +1,6 @@
 {
   "name": "doh-cloudflare-worker",
-  "version": "0.4.0",
+  "version": "0.5.2",
   "private": true,
   "type": "module",
   "engines": {
@@ -8,6 +8,6 @@
   },
   "scripts": {
     "test": "node --test",
-    "check": "npx --yes wrangler@4 deploy --dry-run --outdir .wrangler-dry-run"
+    "check": "npx --yes wrangler@4.151.0 deploy --dry-run --outdir .wrangler-dry-run"
   }
 }

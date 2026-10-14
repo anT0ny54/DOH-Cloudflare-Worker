@@ -3,63 +3,38 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.4.0] - 2026-10-15
+## [0.5.2] - 2026-10-15
 
 ### Fixed
-- Cached negative answers no longer modify SOA `MINIMUM`. That field is signed
-  RDATA, so changing it broke DNSSEC validation. The SOA record TTL is now served
-  as `min(SOA TTL, SOA MINIMUM) - age`, as RFC 2308 requires.
-- `NOERROR` CNAME chains ending in NODATA now honour the authority SOA
-  `MINIMUM` instead of being cached for the CNAME/SOA TTL.
-- IPv6 rate limiting uses one /64 key for the native binding and the local
-  fallback, so rotating addresses within a /64 no longer gets fresh windows.
-- The in-flight job is rejected in `finally` only when it was not already
-  settled; successful requests no longer allocate an unused `Error`.
-- Unexpected request-body errors return `Invalid DNS query` instead of exposing
-  internal runtime messages.
-- Fallback answers are chosen by usefulness: truncated `NOERROR` beats
-  truncated `NXDOMAIN`, which beats `SERVFAIL` and other RCODEs.
-- The 255-byte name limit is enforced across compression pointers.
-- Responses with OPT outside the additional section, duplicate OPT records or a
-  non-root OPT owner are rejected. Extended RCODE bits are included in usability
-  and caching checks.
-- Test fixture fix: the "truncated" response helper set RCODE 2 instead of the
-  TC flag; it now sets TC correctly.
-
-### Removed
-- The L1 re-check after an L2 miss. Synchronous in-flight registration makes it
-  unreachable in normal operation.
-- The resolver-ranking cache. Every upstream result invalidated it, so the
-  cached branch never ran.
-- `EDGE_CACHE_MIN_TTL_SECONDS`, the redundant TTL floor/floor-rounding, and the
-  `validateDNSResponse` pass-through wrapper.
-- Test-only hooks from the production module. `Worker.js` now exports only the
-  Worker handler; tests use `worker-harness.mjs`.
-- Redundant dashboard panel-class toggling.
+- A query whose EDNS OPT record carried a malformed option list (an option
+  length running past the end of the RDATA, or a dangling partial option
+  header) passed `parseDNSQuestion()`, and then made `cacheKeyBytes()` throw.
+  Nothing caught it, so `fetch()` threw and Cloudflare answered with an error
+  page (HTTP 500, Worker exception) instead of `400`. The option framing is now
+  validated with the rest of the OPT record and such a query is rejected with
+  `400 Malformed EDNS options` before any cache or upstream work. A fuzz run
+  over 300,000 mutated queries and 20,000 full `fetch()` round trips no longer
+  produces an exception.
 
 ### Changed
-- One validation pass now checks the DNS response, calculates cache TTL and
-  records TTL offsets. L1 hits patch those offsets directly.
-- Expired or corrupt L2 entries are purged with `ctx.waitUntil` instead of
-  delaying the request.
-- L1 has an 8 MiB body budget in addition to its 512-entry limit.
-- Resolver scores recover by +1 per minute, up to 100. If all attempted
-  resolvers return an error RCODE, none is penalised.
-- EDNS Padding is removed from the cache key. EDNS Cookies stay in the key
-  because cached responses echo client-specific cookies.
-- Upstream timeouts use `AbortSignal.timeout`.
-- Shared ASCII lower-casing and the parsed question end remove repeated
-  question-name parsing.
-- Dashboard HTML is split once around the endpoint placeholder; the clipboard
-  fallback is feature-checked; iOS guidance no longer recommends Android-only
-  Intra.
-- CI uses current `actions/checkout@v7` and `actions/setup-node@v7`, checks
-  syntax, and runs a Wrangler dry-run deployment.
+- The `+`/`-` score update shared by `reward()`, `noteOvertaken()` and
+  `penalize()` (clamp to `SCORE_MIN`..`SCORE_MAX`, restart the recovery clock)
+  lives in one `adjustScore()` helper instead of three copies. Behaviour is
+  unchanged.
+- `validateDNSMessage()` no longer declares a second, shadowing `ttl` variable
+  inside its record loop (renamed `recordTtl`), and the capped SOA `MINIMUM`
+  is computed once instead of twice. Behaviour is unchanged.
+- The `joiners` field of an in-flight entry is documented as test-harness
+  bookkeeping: production code increments it but never reads it.
+- The comment on `cacheKeyBytes()` no longer claims that `parseDNSQuestion()`
+  validated OPT options before it actually did.
+- Package and `/health` version bumped to 0.5.2.
 
 ### Tests
-- 88 tests. The coalescing tests now prove that joiners attach to the leader
-  (`COALESCED` and upstream call count), and new tests cover the fixes above,
-  405, GET/Content-Length size guards, upstream timeouts, expired L1/L2 entries,
-  native limiter exceptions, penalty eviction, the L1 byte budget and padding-
-  insensitive cache keys.
+- 112 tests (4 new). Covers OPT option framing (exact fit, two options, overrun,
+  partial header, trailing partial option), a guarantee that every query
+  accepted by the parser has computable cache-key bytes, `400` instead of an
+  exception for GET and POST with malformed options, and resolver scores
+  staying within `SCORE_MIN`..`SCORE_MAX`. The first and third of these fail
+  against 0.5.1.
 

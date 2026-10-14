@@ -1,10 +1,14 @@
 import test, { beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import worker, { __internals } from './worker-harness.mjs';
+const { version: PACKAGE_VERSION } = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
 // Module-level state (resolver statistics, L1/L2 caches, throttle/penalty
 // maps, in-flight jobs, resolver rotation cursor) is shared between tests in
 // this file, so every test starts from a clean slate.
 beforeEach(() => { __internals.resetAppState(); });
+// Big-endian 32-bit value as four bytes (record TTLs, SOA fields).
+function u32(v) { return [(v >>> 24) & 0xff, (v >>> 16) & 0xff, (v >>> 8) & 0xff, v & 0xff]; }
 function makeQuery(name, id = 0x1234, flags = 0x0100) {
   const labels = name === '.' ? [] : name.split('.');
   const bytes = [
@@ -40,7 +44,9 @@ async function withGlobalRuntimeMocks(fn, { fetch, caches } = {}) {
   await previous;
   const originalFetch = globalThis.fetch;
   const originalCaches = globalThis.caches;
-  if (fetch) globalThis.fetch = fetch;
+  // The Worker queries upstreams with RFC 8484 GET; mocks receive the decoded
+  // DNS query as init.body so they can build matching answers.
+  if (fetch) globalThis.fetch = (url, init = {}) => fetch(url, { ...init, originalBody: init.body, body: queryFromURL(url) });
   if (caches) globalThis.caches = caches;
   try {
     return await fn();
@@ -50,6 +56,10 @@ async function withGlobalRuntimeMocks(fn, { fetch, caches } = {}) {
     else globalThis.caches = originalCaches;
     release();
   }
+}
+function queryFromURL(url) {
+  const dns = new URL(url).searchParams.get('dns');
+  return dns ? __internals.decodeBase64Url(dns) : undefined;
 }
 function makeAResponse(query, ttl = 100, rcode = 0) {
   const bytes = Array.from(query);
@@ -157,6 +167,8 @@ test('health endpoint returns current hardening configuration', async () => {
   assert.equal(body.maxUpstreamDNSMessageBytes, 65535);
   assert.equal(body.rateLimit.invalidBindingFallback, 'per-isolate local limiter');
   assert.equal(body.maxSimultaneousUpstreams, 3);
+  assert.equal(body.version, PACKAGE_VERSION);
+  assert.equal(body.stateSweepIntervalSeconds, 60);
 });
 test('coalesced upstream failures return controlled 502 responses', async () => {
   let calls = 0;
@@ -166,11 +178,12 @@ test('coalesced upstream failures return controlled 502 responses', async () => 
     const first = postQuery('coalesced-fail.example', 'coalesce-fail-1');
     await waitForInflight('coalesced-fail.example');
     const second = postQuery('coalesced-fail.example', 'coalesce-fail-2');
-    await waitForJoiner();
+    await waitForJoiners('coalesced-fail.example', 1);
     release();
     const [firstRes, secondRes] = await Promise.all([first, second]);
     assert.equal(firstRes.status, 502);
     assert.equal(secondRes.status, 502);
+    assert.equal(firstRes.headers.get('x-upstreams'), '3');
     assert.equal(secondRes.headers.get('x-upstreams'), '0');
     assert.equal(calls, 3);
   }, {
@@ -254,7 +267,7 @@ test('malformed native rate limiter falls back to local limiter', async () => {
     }
   };
   const ip = 'rate-fallback-test';
-  for (let i = 0; i < 100; i++) {
+  for (let i = 0; i < __internals.CONFIG.RATE_LIMIT_MAX_REQUESTS; i++) {
     const req = new Request('https://workers.example/dns-query', {
       headers: { 'cf-connecting-ip': ip }
     });
@@ -275,7 +288,7 @@ test('coalesced degraded results propagate x-dns-degraded', async () => {
     const first = postQuery('degraded.example', 'degraded-1');
     await waitForInflight('degraded.example');
     const second = postQuery('degraded.example', 'degraded-2');
-    await waitForJoiner();
+    await waitForJoiners('degraded.example', 1);
     releaseUpstream();
     const [firstRes, secondRes] = await Promise.all([first, second]);
     assert.equal(firstRes.status, 200);
@@ -295,12 +308,6 @@ test('coalesced degraded results propagate x-dns-degraded', async () => {
     },
     caches: cacheMock()
   });
-});
-test('health reports version and sweep interval', async () => {
-  const res = await worker.fetch(new Request('https://workers.example/health'), {}, {});
-  const body = await res.json();
-  assert.equal(body.version, '0.4.0');
-  assert.equal(body.stateSweepIntervalSeconds, 60);
 });
 test('DNS name wire length boundary is enforced', () => {
   const validName = [
@@ -363,7 +370,6 @@ function makeNxdomainWithSOA(query, ttl, minimum) {
   bytes[2] = 0x81;
   bytes[3] = 0x83;
   bytes[9] = 1;
-  const u32 = (v) => [(v >>> 24) & 0xff, (v >>> 16) & 0xff, (v >>> 8) & 0xff, v & 0xff];
   const rdata = [
     2, 110, 115, 0,
     2, 104, 109, 0,
@@ -372,15 +378,18 @@ function makeNxdomainWithSOA(query, ttl, minimum) {
   bytes.push(0xc0, 0x0c, 0, 6, 0, 1, ...u32(ttl), 0, rdata.length, ...rdata);
   return new Uint8Array(bytes);
 }
-async function waitForInflight(name) {
-  const key = await __internals.makeCacheKey(makeQuery(name));
-  for (let i = 0; i < 100 && !__internals.hasInflight(key); i++) {
+async function waitUntilTrue(check) {
+  for (let i = 0; i < 500 && !check(); i++) {
     await new Promise((resolve) => setTimeout(resolve, 1));
   }
-  assert.equal(__internals.hasInflight(key), true);
+  assert.equal(check(), true);
 }
-async function waitForJoiner() {
-  await new Promise((resolve) => setTimeout(resolve, 25));
+async function waitForInflight(name) {
+  await waitUntilTrue(() => __internals.hasInflight(makeQuery(name)));
+}
+// Deterministic: waits until `count` requests have attached to the leader.
+async function waitForJoiners(name, count) {
+  await waitUntilTrue(() => __internals.joinerCount(makeQuery(name)) >= count);
 }
 function cacheMock() {
   return { default: { match: async () => null, put: async () => {} } };
@@ -436,55 +445,19 @@ test('cache hit echoes client case and tolerates a ctx without waitUntil', async
   });
 });
 test('SERVFAIL is not force-cached in L1', async () => {
-  let releaseUpstream;
-  const gate = new Promise((resolve) => { releaseUpstream = resolve; });
   await withGlobalRuntimeMocks(async () => {
-    const first = postQuery('servfail-nocache.example', 'sf-test');
-    await new Promise((resolve) => setImmediate(resolve));
-    releaseUpstream();
-    const firstRes = await first;
-    assert.equal(firstRes.status, 200);
-    assert.equal(firstRes.headers.get('x-dns-degraded'), '1');
-    const third = await postQuery('servfail-nocache.example', 'sf-test');
-    assert.equal(third.headers.get('x-cache'), 'MISS');
+    const first = await postQuery('servfail-nocache.example', 'sf-test');
+    assert.equal(first.status, 200);
+    assert.equal(first.headers.get('x-dns-degraded'), '1');
+    const second = await postQuery('servfail-nocache.example', 'sf-test');
+    assert.equal(second.headers.get('x-cache'), 'MISS');
   }, {
     fetch: async (_url, init) => {
-      await gate;
       return new Response(makeAResponse(init.body, 60, 2), {
         status: 200,
         headers: { 'content-type': 'application/dns-message' }
       });
     },
-    caches: cacheMock()
-  });
-});
-test('requests joining a failed in-flight resolution get a 502, not an exception', async () => {
-  let releaseUpstream;
-  const gate = new Promise((resolve) => { releaseUpstream = resolve; });
-  await withGlobalRuntimeMocks(async () => {
-    const first = postQuery('joinfail.example', 'join-fail');
-    // Wait until the leader has registered its inflight entry (its digest is
-    // async, so a bare setImmediate is not enough on every Node version).
-    const joinKey = await __internals.makeCacheKey(makeQuery('joinfail.example'));
-    for (let i = 0; i < 100 && !__internals.hasInflight(joinKey); i++) {
-      await new Promise((resolve) => setTimeout(resolve, 1));
-    }
-    assert.equal(__internals.hasInflight(joinKey), true);
-    const second = postQuery('joinfail.example', 'join-fail');
-    // Give the joiner time to finish its async parse/digest and attach to the
-    // leader's inflight job before releasing the upstream gate (a single
-    // setImmediate is not enough on every Node version).
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    releaseUpstream();
-    const results = await Promise.allSettled([first, second]);
-    for (const r of results) {
-      assert.equal(r.status, 'fulfilled');
-      assert.equal(r.value.status, 502);
-    }
-    assert.equal(results[0].value.headers.get('x-upstreams'), '3');
-    assert.equal(results[1].value.headers.get('x-upstreams'), '0');
-  }, {
-    fetch: async () => { await gate; throw new Error('upstream down'); },
     caches: cacheMock()
   });
 });
@@ -533,7 +506,7 @@ test('selectRacers puts the healthiest resolver first and keeps all three', () =
   assert.equal(racers[0].order, 1);
   assert.deepEqual(racers.map((n) => n.order).sort(), [0, 1, 2]);
 });
-test('localRateLimit allows 100 requests per window then blocks', () => {
+test('localRateLimit allows RATE_LIMIT_MAX_REQUESTS per window then blocks', () => {
   const ip = 'local-limit-unit-test';
   for (let i = 0; i < __internals.CONFIG.RATE_LIMIT_MAX_REQUESTS; i++) {
     assert.equal(__internals.localRateLimit(ip), true);
@@ -551,7 +524,7 @@ test('localRateLimit survives a table-overflow flood without a fresh window', ()
     __internals.localRateLimit(`lru-filler-${i}`);
   }
   // The flood evicted `busy` from the main table, but its window survives in
-  // the penalty map: it must NOT get a fresh 100-request window.
+  // the penalty map: it must NOT get a fresh request window.
   assert.equal(__internals.localRateLimit(busy), false);
 });
 test('hedging: first resolver fails, second answers, third is never contacted', async () => {
@@ -583,7 +556,7 @@ test('hedging: all three resolvers failing returns 502 with x-upstreams 3', asyn
     caches: cacheMock()
   });
 });
-test('hedging: the slower attempt is aborted once another resolver answers and is not penalised', async () => {
+test('hedging: the slower attempt is aborted and not counted as a failure or timeout', async () => {
   const signals = [];
   await withGlobalRuntimeMocks(async () => {
     const before = (await (await worker.fetch(new Request('https://workers.example/health'), {}, {})).json())
@@ -656,7 +629,6 @@ test('getDNSCacheTTL treats SOA MINIMUM with the MSB set as zero (RFC 2181)', ()
 function makeAWithAuthority(query, answerTtl, authorityTtl) {
   const bytes = Array.from(makeAResponse(query, answerTtl));
   bytes[9] = 1; // nscount = 1 (an NS record in the authority section)
-  const u32 = (v) => [(v >>> 24) & 0xff, (v >>> 16) & 0xff, (v >>> 8) & 0xff, v & 0xff];
   bytes.push(0xc0, 0x0c, 0, 2, 0, 1, ...u32(authorityTtl), 0, 0);
   return new Uint8Array(bytes);
 }
@@ -695,7 +667,18 @@ test('dashboard forbids framing and is served with a restrictive CSP', async () 
   const res = await worker.fetch(new Request('https://workers.example/'), {}, {});
   assert.equal(res.status, 200);
   assert.match(res.headers.get('content-security-policy'), /frame-ancestors 'none'/);
-  assert.match(await res.text(), /v0\.4\.0/);
+  assert.ok((await res.text()).includes(`v${PACKAGE_VERSION}`));
+});
+test('dashboard CSS keeps escaped utility selectors', async () => {
+  const html = await (await worker.fetch(new Request('https://workers.example/'), {}, {})).text();
+  // Unescaped forms such as ".md:p-12{" or ".min-h-[300px]{" are invalid CSS
+  // and silently dropped by browsers.
+  for (const selector of ['.md\\:p-12{', '.min-h-\\[300px\\]{', '.bg-black\\/40{', '.hover\\:bg-cyan-400:hover{',
+    '.rounded-\\[3\\.5rem\\]{', '.tracking-\\[0\\.3em\\]{']) {
+    assert.ok(html.includes(selector), `missing ${selector}`);
+  }
+  assert.doesNotMatch(html, /\.(?:md|hover|active|focus):[a-z]/);
+  assert.doesNotMatch(html, /\.[a-z0-9-]+-\[[^\]]+\]\{/);
 });
 test('validateDNSResponse rejects QNAME, QTYPE and QCLASS mismatches', () => {
   const query = makeQuery('mismatch.example');
@@ -785,14 +768,35 @@ test('readCappedBody keeps exact boundaries when a stream yields a single subarr
   assert.equal(exact.byteLength, query.length);
   assert.deepEqual(Array.from(new Uint8Array(exact)), Array.from(query));
 });
-test('upstream fetch pins the redirect policy to error', async () => {
+test('upstream queries use RFC 8484 GET with the client query as base64url', async () => {
+  const seen = [];
+  await withGlobalRuntimeMocks(async () => {
+    const res = await postQuery('get-upstream.example', 'get-upstream');
+    assert.equal(res.status, 200);
+    assert.equal(seen[0].method, 'GET');
+    assert.equal(seen[0].hasBody, false);
+    assert.deepEqual(Array.from(queryFromURL(seen[0].url)), Array.from(makeQuery('get-upstream.example')));
+  }, {
+    fetch: async (url, init) => {
+      seen.push({ url, method: init.method, hasBody: init.originalBody != null });
+      return new Response(makeAResponse(init.body, 60), { headers: { 'content-type': 'application/dns-message' } });
+    },
+    caches: cacheMock()
+  });
+});
+test('upstream redirects are never followed and count as a resolver failure', async () => {
+  const seen = [];
   await withGlobalRuntimeMocks(async () => {
     const res = await postQuery('redirect-policy.example', 'redirect-test');
     assert.equal(res.status, 502);
+    assert.equal(res.headers.get('x-upstreams'), '3');
+    // Workers only implements 'follow' and 'manual'; 'error' throws at runtime.
+    assert.deepEqual([...new Set(seen)], ['manual']);
+    assert.ok(__internals.getHealthSnapshot().upstreams.every((u) => /HTTP 307/.test(u.lastError)));
   }, {
     fetch: async (_url, init) => {
-      assert.equal(init.redirect, 'error');
-      throw new Error('unreachable upstream');
+      seen.push(init.redirect);
+      return new Response(null, { status: 307, headers: { location: 'https://elsewhere.example/dns-query' } });
     },
     caches: cacheMock()
   });
@@ -870,8 +874,7 @@ test('getDNSCacheTTL ignores SOA records with trailing or missing bytes', () => 
 });
 function makeTruncatedResponse(query, rcode = 0) {
   const bytes = Array.from(query);
-  bytes[2] = 0x81;
-  bytes[2] |= 0x02; // TC is in the high flag byte
+  bytes[2] = 0x83; // QR + TC (TC is in the high flag byte) + RD
   bytes[3] = 0x80 | (rcode & 0x0f);
   return new Uint8Array(bytes);
 }
@@ -973,15 +976,15 @@ test('patchDNSResponseForAge ages SOA TTL without modifying signed MINIMUM', () 
   const q = query.length;
   const response = makeNxdomainWithSOA(query, 300, 45);
   const aged = new Uint8Array(__internals.patchDNSResponseForAge(response, 0x1234, 10));
-  const u32 = (b, o) => ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;
-  assert.equal(u32(aged, q + 6), 35); // SOA TTL
-  assert.equal(u32(aged, q + 36), 45); // SOA MINIMUM
+  const readU32 = (b, o) => ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;
+  assert.equal(readU32(aged, q + 6), 35); // SOA TTL
+  assert.equal(readU32(aged, q + 36), 45); // SOA MINIMUM
   // Ageing past the lifetime clamps both at zero rather than wrapping.
   const expired = new Uint8Array(__internals.patchDNSResponseForAge(response, 0x1234, 1000));
-  assert.equal(u32(expired, q + 6), 0);
-  assert.equal(u32(expired, q + 36), 45);
+  assert.equal(readU32(expired, q + 6), 0);
+  assert.equal(readU32(expired, q + 36), 45);
   // The source buffer is never modified.
-  assert.equal(u32(response, q + 36), 45);
+  assert.equal(readU32(response, q + 36), 45);
 });
 test('patchDNSResponseForAge accepts ArrayBuffer and Uint8Array input without mutating it', () => {
   const query = makeQuery('copy.example');
@@ -1084,7 +1087,6 @@ test('malformed error responses are rejected, well-formed ones stay accepted', (
 });
 
 // ---- 0.4.0 regressions and previously uncovered paths ----
-function u32(v) { return [(v >>> 24) & 0xff, (v >>> 16) & 0xff, (v >>> 8) & 0xff, v & 0xff]; }
 function makeCnameNodata(query) {
   const b = Array.from(query);
   b[2] = 0x81; b[3] = 0x80; b[7] = 1; b[9] = 1;
@@ -1099,15 +1101,20 @@ test('CNAME to NODATA answers respect SOA MINIMUM', () => {
 test('IPv6 rate-limit keys use the /64 prefix', () => {
   assert.equal(__internals.rateLimitKey('2001:db8:1:2:3:4:5:6'), '2001:db8:1:2::/64');
   assert.equal(__internals.rateLimitKey('2001:db8:1:2::9'), '2001:db8:1:2::/64');
-  for (let i = 0; i < 100; i++) assert.equal(__internals.localRateLimit(`2001:db8:9:9::${i.toString(16)}`), true);
+  const max = __internals.CONFIG.RATE_LIMIT_MAX_REQUESTS;
+  for (let i = 0; i < max; i++) assert.equal(__internals.localRateLimit(`2001:db8:9:9::${i.toString(16)}`), true);
   assert.equal(__internals.localRateLimit('2001:db8:9:9:ffff::1'), false);
 });
 test('EDNS padding does not split cache keys', async () => {
-  const pad = (len) => { const q = withOPT(makeQuery('pad.example')); const out = Array.from(q); out[out.length - 1] = len + 4; out.push(0, 12, 0, len, ...new Array(len).fill(0)); return Uint8Array.from(out); };
-  assert.equal(await __internals.makeCacheKey(pad(1)), await __internals.makeCacheKey(pad(20)));
+  const query = makeQuery('pad.example');
+  assert.equal(await __internals.makeCacheKey(withPadding(query, 1)), await __internals.makeCacheKey(withPadding(query, 20)));
 });
-test('fallback priority prefers truncated NOERROR over error RCODEs', () => {
-  assert.ok(__internals.fallbackPriority({ rcode: 0 }) > __internals.fallbackPriority({ rcode: 2 }));
+test('fallback priority: truncated NOERROR > truncated NXDOMAIN > SERVFAIL > other RCODEs', () => {
+  const p = (rcode) => __internals.fallbackPriority({ rcode });
+  assert.ok(p(0) > p(3));
+  assert.ok(p(3) > p(2));
+  assert.ok(p(2) > p(5));
+  assert.equal(p(5), p(4));
 });
 test('resolver scores recover over time to the starting score', () => {
   const node = { score: 80, lastScoreUpdateAt: 1 };
@@ -1157,7 +1164,7 @@ test('upstream timeouts are recorded', async () => {
 });
 test('expired L2 and expired L1 entries are discarded', async () => {
   const query = makeQuery('expired.example');
-  const key = await __internals.makeCacheKey(query);
+  const key = __internals.localKeyOf(query);
   let deleted = 0;
   __internals.setCache(key, makeAResponse(query).buffer, 1, Date.now() - 2000);
   const originalNow = Date.now;
@@ -1194,4 +1201,314 @@ test('compression pointer targets count toward the 255-byte name limit', () => {
   const answer = query.length;
   response.splice(answer, 2, 1, 120, ...new Array(120).fill(120), 0xc0, 0x0c);
   assert.equal(__internals.validateDNSResponse(Uint8Array.from(response), 0x1234, query).ok, false);
+});
+
+// ---- 0.5.0 regressions ----
+const { CONFIG: CFG } = __internals;
+function okResponse(init, ttl = 60) {
+  return new Response(makeAResponse(init.body, ttl), { headers: { 'content-type': 'application/dns-message' } });
+}
+function neverAnswers(init) {
+  return new Promise((_resolve, reject) => init.signal.addEventListener('abort', () => reject(new Error('aborted'))));
+}
+function withPadding(query, len) {
+  const out = Array.from(withOPT(query));
+  out[out.length - 1] = len + 4; // OPT rdlength
+  out.push(0, 12, 0, len, ...new Array(len).fill(0));
+  return Uint8Array.from(out);
+}
+function mkNode(order, score, ewmaLatencyMs) {
+  return { url: `u${order}`, order, score, ewmaLatencyMs, lastScoreUpdateAt: Date.now() };
+}
+test('wrangler.toml rate limit matches the local fallback limiter', () => {
+  const toml = readFileSync(new URL('./wrangler.toml', import.meta.url), 'utf8');
+  assert.equal(Number(/^limit\s*=\s*(\d+)/m.exec(toml)[1]), CFG.RATE_LIMIT_MAX_REQUESTS);
+  assert.equal(Number(/^period\s*=\s*(\d+)/m.exec(toml)[1]) * 1000, CFG.RATE_LIMIT_WINDOW_MS);
+});
+test('an attempt overtaken by a hedge is penalised and its latency learned', async () => {
+  await withGlobalRuntimeMocks(async () => {
+    const res = await postQuery('overtaken.example', 'overtaken');
+    assert.equal(res.headers.get('x-upstreams'), '2');
+    const root = __internals.RESOLVER_NODES[0];
+    assert.equal(root.slow, 1);
+    assert.equal(root.score, CFG.SCORE_START - CFG.SCORE_SLOW_DELTA);
+    assert.ok(root.ewmaLatencyMs >= CFG.HEDGE_MIN_MS, `ewma ${root.ewmaLatencyMs}`);
+    assert.equal(root.fail + root.timeout, 0);
+  }, {
+    fetch: (url, init) => (url.includes('root.') ? neverAnswers(init) : Promise.resolve(okResponse(init))),
+    caches: cacheMock()
+  });
+});
+test('a resolver that keeps losing to hedges stops being chosen first', async () => {
+  const first = new Map();
+  await withGlobalRuntimeMocks(async () => {
+    for (let i = 0; i < 12; i++) await postQuery(`learn-${i}.example`, `learn-${i}`);
+  }, {
+    fetch: (url, init) => {
+      const key = Buffer.from(init.body).toString('hex');
+      if (!first.has(key)) first.set(key, url);
+      return url.includes('root.') ? neverAnswers(init) : Promise.resolve(okResponse(init));
+    },
+    caches: cacheMock()
+  });
+  const rootFirst = [...first.values()].filter((url) => url.includes('root.')).length;
+  assert.ok(rootFirst <= 2, `slow resolver led ${rootFirst} of 12 resolutions`);
+});
+test('selectRacers prefers the lowest learned latency inside the pool', () => {
+  const racers = __internals.selectRacers([mkNode(0, 100, 90), mkNode(1, 100, 20), mkNode(2, 100, 40)]);
+  assert.deepEqual(racers.map((n) => n.order), [1, 2, 0]);
+});
+test('a resolver that just timed out leaves the first-choice pool', () => {
+  const racers = __internals.selectRacers([
+    mkNode(0, CFG.SCORE_START - CFG.SCORE_TIMEOUT_DELTA, 10), mkNode(1, 100, 50), mkNode(2, 100, 60)
+  ]);
+  assert.deepEqual(racers.map((n) => n.order), [1, 2, 0]);
+});
+test('every Nth resolution explores another pool member first', () => {
+  const nodes = [mkNode(0, 100, 90), mkNode(1, 100, 20), mkNode(2, 100, 40)];
+  const firsts = [];
+  for (let i = 0; i < CFG.PRIMARY_EXPLORE_EVERY; i++) firsts.push(__internals.selectRacers(nodes)[0].order);
+  assert.deepEqual(firsts.slice(0, -1), new Array(CFG.PRIMARY_EXPLORE_EVERY - 1).fill(1));
+  assert.notEqual(firsts.at(-1), 1);
+});
+test('truncated answers from every resolver penalise nobody', async () => {
+  await withGlobalRuntimeMocks(async () => {
+    const res = await postQuery('tc-everyone.example', 'tc-everyone');
+    assert.equal(res.headers.get('x-dns-degraded'), '1');
+    assert.deepEqual(__internals.getHealthSnapshot().upstreams.map((u) => u.score), [100, 100, 100]);
+  }, {
+    fetch: async (_url, init) => new Response(makeTruncatedResponse(init.body), { headers: { 'content-type': 'application/dns-message' } }),
+    caches: cacheMock()
+  });
+});
+test('a truncated answer is penalised when another resolver answers fully', async () => {
+  await withGlobalRuntimeMocks(async () => {
+    const res = await postQuery('tc-one.example', 'tc-one');
+    assert.equal(res.headers.get('x-dns-degraded'), null);
+    const scores = __internals.getHealthSnapshot().upstreams.map((u) => u.score);
+    assert.equal(scores[0], CFG.SCORE_START - CFG.SCORE_FAILURE_DELTA);
+  }, {
+    fetch: async (url, init) => (url.includes('root.')
+      ? new Response(makeTruncatedResponse(init.body), { headers: { 'content-type': 'application/dns-message' } })
+      : okResponse(init)),
+    caches: cacheMock()
+  });
+});
+test('/health reports scores after time-based recovery', () => {
+  const node = __internals.RESOLVER_NODES[0];
+  node.score = 90;
+  node.lastScoreUpdateAt = Date.now() - 3 * CFG.SCORE_RECOVERY_INTERVAL_MS;
+  assert.equal(__internals.getHealthSnapshot().upstreams[0].score, 93);
+});
+test('EDNS padding presence stays in the cache key, its length does not', () => {
+  const query = makeQuery('pad-presence.example');
+  const { localKeyOf, cacheKeyBytes } = __internals;
+  assert.equal(localKeyOf(withPadding(query, 1)), localKeyOf(withPadding(query, 30)));
+  assert.notEqual(localKeyOf(withOPT(query)), localKeyOf(withPadding(query, 1)));
+  const key = cacheKeyBytes(withPadding(query, 30));
+  assert.deepEqual(Array.from(key.slice(-6)), [0, 4, 0, 12, 0, 0]); // rdlength 4 + empty padding
+});
+test('cache key bytes zero the ID and lower-case only the question name', () => {
+  const key = __internals.cacheKeyBytes(makeQuery('MiXeD.Example', 0xbeef));
+  assert.deepEqual(Array.from(key), Array.from(makeQuery('mixed.example', 0)));
+});
+test('a stale in-flight entry is ignored and replaced', async () => {
+  const query = makeQuery('stale.example');
+  await withGlobalRuntimeMocks(async () => {
+    __internals.injectInflight(query, {
+      job: new Promise(() => {}), createdAt: Date.now() - CFG.INFLIGHT_JOIN_TIMEOUT_MS - 1, joiners: 0
+    });
+    const res = await postQuery('stale.example', 'stale');
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('x-cache'), 'MISS');
+    assert.equal(__internals.hasInflight(query), false);
+  }, { fetch: async (_url, init) => okResponse(init), caches: cacheMock() });
+});
+test('a joiner whose leader never settles resolves on its own after the join timeout', async () => {
+  const old = CFG.INFLIGHT_JOIN_TIMEOUT_MS;
+  CFG.INFLIGHT_JOIN_TIMEOUT_MS = 30;
+  try {
+    await withGlobalRuntimeMocks(async () => {
+      __internals.injectInflight(makeQuery('lost-leader.example'), { job: new Promise(() => {}), createdAt: Date.now(), joiners: 0 });
+      const res = await postQuery('lost-leader.example', 'lost-leader');
+      assert.equal(res.status, 200);
+      assert.equal(res.headers.get('x-cache'), 'MISS');
+    }, { fetch: async (_url, init) => okResponse(init), caches: cacheMock() });
+  } finally {
+    CFG.INFLIGHT_JOIN_TIMEOUT_MS = old;
+  }
+});
+test('the upstream job is detached with ctx.waitUntil and cleans up its in-flight entry', async () => {
+  const scheduled = [];
+  await withGlobalRuntimeMocks(async () => {
+    const res = await postQuery('detached.example', 'detached', { waitUntil: (p) => { scheduled.push(p); } });
+    assert.equal(res.status, 200);
+    assert.ok(scheduled.length >= 1);
+    await Promise.all(scheduled);
+    assert.equal(__internals.hasInflight(makeQuery('detached.example')), false);
+  }, { fetch: async (_url, init) => okResponse(init), caches: cacheMock() });
+});
+test('a fresh answer echoes the leader case without altering the cached copy', async () => {
+  await withGlobalRuntimeMocks(async () => {
+    const first = await postQuery('MiXeD-Fresh.example', 'fresh-case');
+    assert.equal(first.headers.get('x-cache'), 'MISS');
+    const firstBody = new Uint8Array(await first.arrayBuffer());
+    assert.deepEqual(Array.from(firstBody.slice(12, 32)), Array.from(makeQuery('MiXeD-Fresh.example').slice(12, 32)));
+    const second = await postQuery('mixed-fresh.example', 'fresh-case');
+    assert.equal(second.headers.get('x-cache'), 'L1-HIT');
+    const secondBody = new Uint8Array(await second.arrayBuffer());
+    assert.deepEqual(Array.from(secondBody.slice(12, 32)), Array.from(makeQuery('mixed-fresh.example').slice(12, 32)));
+  }, { fetch: async () => okResponse({ body: makeQuery('mixed-fresh.example') }), caches: cacheMock() });
+});
+test('OPTIONS preflight is answered before the rate limiter, and DNS responses carry CORS', async () => {
+  const denied = { DNS_RATE_LIMITER: { limit: async () => ({ success: false }) } };
+  const pre = await worker.fetch(new Request('https://workers.example/dns-query', { method: 'OPTIONS' }), denied, {});
+  assert.equal(pre.status, 204);
+  assert.equal(pre.headers.get('access-control-allow-origin'), '*');
+  assert.match(pre.headers.get('access-control-allow-methods'), /POST/);
+  assert.match(pre.headers.get('access-control-allow-headers'), /content-type/);
+  const limited = await worker.fetch(new Request('https://workers.example/dns-query'), denied, {});
+  assert.equal(limited.status, 429);
+  assert.equal(limited.headers.get('access-control-allow-origin'), '*');
+  await withGlobalRuntimeMocks(async () => {
+    const res = await postQuery('cors.example', 'cors');
+    assert.equal(res.headers.get('access-control-allow-origin'), '*');
+    assert.match(res.headers.get('access-control-expose-headers'), /x-cache/);
+  }, { fetch: async (_url, init) => okResponse(init), caches: cacheMock() });
+});
+
+// ---- 0.5.1 regressions ----
+test('an NXDOMAIN without a question section is rejected, a SERVFAIL without one is not', () => {
+  const query = makeQuery('noq-nx.example');
+  // Header (QDCOUNT 0, NSCOUNT 1) plus one SOA record with a root owner name.
+  const soa = [2, 110, 115, 0, 2, 104, 109, 0, ...u32(1), ...u32(3600), ...u32(600), ...u32(86400), ...u32(60)];
+  const nxdomain = Uint8Array.from([
+    0x12, 0x34, 0x81, 0x83, 0, 0, 0, 0, 0, 1, 0, 0,
+    0, 0, 6, 0, 1, ...u32(300), 0, soa.length, ...soa
+  ]);
+  const result = __internals.validateDNSResponse(nxdomain, 0x1234, query);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /missing question/);
+  const servfail = Uint8Array.from([0x12, 0x34, 0x81, 0x82, 0, 0, 0, 0, 0, 0, 0, 0]);
+  assert.equal(__internals.validateDNSResponse(servfail, 0x1234, query).ok, true);
+});
+test('an upstream NXDOMAIN without a question fails over instead of being cached', async () => {
+  await withGlobalRuntimeMocks(async () => {
+    const res = await postQuery('noq-upstream.example', 'noq-upstream');
+    assert.equal(res.status, 502);
+    assert.equal(res.headers.get('x-upstreams'), '3');
+    assert.equal(__internals.getHealthSnapshot().cacheEntries, 0);
+  }, {
+    fetch: async (_url, init) => {
+      const soa = [2, 110, 115, 0, 2, 104, 109, 0, ...u32(1), ...u32(3600), ...u32(600), ...u32(86400), ...u32(60)];
+      const id = init.body.subarray(0, 2);
+      return new Response(Uint8Array.from([
+        id[0], id[1], 0x81, 0x83, 0, 0, 0, 0, 0, 1, 0, 0,
+        0, 0, 6, 0, 1, ...u32(300), 0, soa.length, ...soa
+      ]), { headers: { 'content-type': 'application/dns-message' } });
+    },
+    caches: cacheMock()
+  });
+});
+test('an L2 entry with bad bookkeeping headers is purged without reading its body', async () => {
+  const query = makeQuery('l2-headers-only.example');
+  const key = await __internals.makeCacheKey(query);
+  let bodyReads = 0;
+  let deletes = 0;
+  await withGlobalRuntimeMocks(async () => {
+    const res = await postQuery('l2-headers-only.example', 'l2-headers-only');
+    assert.equal(res.headers.get('x-cache'), 'MISS');
+    assert.equal(bodyReads, 0);
+    assert.equal(deletes, 1);
+  }, {
+    fetch: async (_url, init) => okResponse(init),
+    caches: {
+      default: {
+        match: async (req) => (req.url.endsWith(key)
+          ? { headers: new Headers({ 'x-doh-ttl': '300' }), arrayBuffer: async () => { bodyReads += 1; return new ArrayBuffer(0); } }
+          : null),
+        delete: async () => { deletes += 1; },
+        put: async () => {}
+      }
+    }
+  });
+});
+test('a rejected upstream job with no joiners and no waitUntil raises no unhandled rejection', async () => {
+  const unhandled = [];
+  const onUnhandled = (reason) => unhandled.push(reason);
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    await withGlobalRuntimeMocks(async () => {
+      const res = await postQuery('no-unhandled.example', 'no-unhandled');
+      assert.equal(res.status, 502);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.deepEqual(unhandled, []);
+    }, { fetch: async () => { throw new Error('down'); }, caches: cacheMock() });
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+  }
+});
+
+// ---- 0.5.2 regressions ----
+// A query whose single EDNS OPT record carries the given RDATA (root owner,
+// type 41, UDP size 4096, zero extended flags, then RDLENGTH and RDATA).
+function withOptRdata(query, rdata) {
+  const out = [...query, 0, 0, 41, 0x10, 0, 0, 0, 0, 0, rdata.length >> 8, rdata.length & 0xff, ...rdata];
+  out[11] = 1;
+  return Uint8Array.from(out);
+}
+test('parseDNSQuestion requires EDNS options to tile the OPT RDATA exactly', () => {
+  const q = makeQuery('opt-framing.example');
+  const parse = (rdata) => __internals.parseDNSQuestion(withOptRdata(q, rdata));
+  assert.equal(parse([]).ok, true);
+  assert.equal(parse([0, 12, 0, 2, 0, 0]).ok, true); // one option, exact fit
+  assert.equal(parse([0, 10, 0, 1, 7, 0, 12, 0, 0]).ok, true); // two options
+  for (const bad of [
+    [0, 12, 0, 223, 1, 2, 3, 4], // option length overruns the RDATA
+    [0, 12, 0], // incomplete option header
+    [0, 12, 0, 2, 0], // option one byte short
+    [0, 10, 0, 1, 7, 0, 12] // valid option followed by a partial header
+  ]) {
+    const parsed = parse(bad);
+    assert.equal(parsed.ok, false, `RDATA ${bad} must be rejected`);
+    assert.match(parsed.error, /EDNS options/);
+  }
+});
+test('every query accepted by parseDNSQuestion has computable cache key bytes', () => {
+  const q = makeQuery('key-invariant.example');
+  for (const rdata of [[], [0, 12, 0, 0], [0, 12, 0, 2, 0, 0], [0, 10, 0, 2, 1, 2, 0, 12, 0, 0]]) {
+    const query = withOptRdata(q, rdata);
+    const parsed = __internals.parseDNSQuestion(query);
+    assert.equal(parsed.ok, true);
+    assert.doesNotThrow(() => __internals.cacheKeyBytes(query, parsed.questionEnd));
+  }
+});
+test('a query with malformed EDNS options gets 400 (not an exception) and never reaches upstream', async () => {
+  let upstreamCalls = 0;
+  const bad = withOptRdata(makeQuery('bad-edns.example'), [0, 12, 0, 223, 1, 2, 3, 4]);
+  await withGlobalRuntimeMocks(async () => {
+    const post = await worker.fetch(new Request('https://workers.example/dns-query', {
+      method: 'POST',
+      headers: { 'content-type': 'application/dns-message', 'cf-connecting-ip': 'bad-edns-post' },
+      body: bad
+    }), {}, {});
+    assert.equal(post.status, 400);
+    const get = await worker.fetch(new Request(
+      `https://workers.example/dns-query?dns=${Buffer.from(bad).toString('base64url')}`,
+      { headers: { 'cf-connecting-ip': 'bad-edns-get' } }
+    ), {}, {});
+    assert.equal(get.status, 400);
+    assert.equal(upstreamCalls, 0);
+  }, { fetch: async () => { upstreamCalls += 1; throw new Error('upstream must not be used'); }, caches: cacheMock() });
+});
+test('resolver scores stay inside [SCORE_MIN, SCORE_MAX]', async () => {
+  await withGlobalRuntimeMocks(async () => {
+    assert.equal((await postQuery('clamp-ok.example', 'clamp-ok')).status, 200);
+    assert.ok(__internals.getHealthSnapshot().upstreams.every((u) => u.score === CFG.SCORE_MAX));
+  }, { fetch: async (_url, init) => okResponse(init), caches: cacheMock() });
+  await withGlobalRuntimeMocks(async () => {
+    // Each failed resolution penalises every resolver once; 10 x 12 > 100.
+    for (let i = 0; i < 10; i++) assert.equal((await postQuery(`clamp-fail-${i}.example`, 'clamp-fail')).status, 502);
+    assert.ok(__internals.getHealthSnapshot().upstreams.every((u) => u.score === CFG.SCORE_MIN));
+  }, { fetch: async () => { throw new Error('down'); }, caches: cacheMock() });
 });

@@ -3,10 +3,11 @@ main = "Worker.js"
 compatibility_date = "2026-09-26"
 
 # Keep this namespace unique when rate-limit counter isolation matters.
+# limit/period must match CONFIG.RATE_LIMIT_* in Worker.js (enforced by a test).
 [[ratelimits]]
 name = "DNS_RATE_LIMITER"
 namespace_id = "1001"
 
 [ratelimits.simple]
-limit = 100
+limit = 600
 period = 60

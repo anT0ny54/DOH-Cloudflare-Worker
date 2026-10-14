@@ -311,7 +311,7 @@ test('coalesced degraded results propagate x-dns-degraded', async () => {
 test('health reports version and sweep interval', async () => {
   const res = await worker.fetch(new Request('https://workers.example/health'), {}, {});
   const body = await res.json();
-  assert.equal(body.version, '0.3.0');
+  assert.equal(body.version, '0.3.2');
   assert.equal(body.stateSweepIntervalSeconds, 60);
 });
 test('DNS name wire length boundary is enforced', () => {
@@ -719,36 +719,11 @@ test('corrupt L2 entries are purged instead of being re-read forever', async () 
     }
   });
 });
-test('an L2 hit refreshes the edge entry so hot keys keep their lifetime', async () => {
-  const query = makeQuery('refresh.example');
-  const key = await __internals.makeCacheKey(query);
-  const storedAt = Date.now() - 100_000; // 100 seconds ago
-  const puts = [];
-  await withGlobalRuntimeMocks(async () => {
-    const ctx = { waitUntil: (promise) => promise };
-    const res = await postQuery('refresh.example', 'refresh-test', ctx);
-    assert.equal(res.headers.get('x-cache'), 'L2-HIT');
-    assert.equal(puts.length, 1);
-    assert.equal(puts[0].headers.get('x-doh-ttl'), '3500');
-  }, {
-    fetch: async () => { throw new Error('upstream must not be used'); },
-    caches: {
-      default: {
-        match: async (req) => (req.url.endsWith(key)
-          ? new Response(makeAResponse(query, 3600).buffer, {
-            headers: { 'x-doh-stored-at': String(storedAt), 'x-doh-ttl': '3600' }
-          })
-          : null),
-        put: async (_req, res) => { puts.push(res); }
-      }
-    }
-  });
-});
 test('dashboard forbids framing and is served with a restrictive CSP', async () => {
   const res = await worker.fetch(new Request('https://workers.example/'), {}, {});
   assert.equal(res.status, 200);
   assert.match(res.headers.get('content-security-policy'), /frame-ancestors 'none'/);
-  assert.match(await res.text(), /v0\.3\.0/);
+  assert.match(await res.text(), /v0\.3\.2/);
 });
 test('validateDNSResponse rejects QNAME, QTYPE and QCLASS mismatches', () => {
   const query = makeQuery('mismatch.example');
@@ -965,4 +940,172 @@ test('all-truncated upstreams return a degraded answer without caching it', asyn
     }),
     caches: cacheMock()
   });
+});
+
+// ---- Regression tests: L2 refresh TTLs, query and response validation ----
+function readAnswerTTL(bytes, queryLength) {
+  // makeAResponse: [query][c0 0c][type][class][ttl x4][rdlen][rdata]
+  const o = queryLength + 6;
+  return ((bytes[o] << 24) | (bytes[o + 1] << 16) | (bytes[o + 2] << 8) | bytes[o + 3]) >>> 0;
+}
+function withOPT(query, { arcount = 1, truncateBy = 0, extra = [] } = {}) {
+  const opt = [0, 0, 41, 0x10, 0, 0, 0, 0, 0, 0, 0]; // root, OPT, 4096, rdlen 0
+  const out = Array.from(query).concat(opt.slice(0, opt.length - truncateBy), extra);
+  out[11] = arcount;
+  return new Uint8Array(out);
+}
+test('an L2 hit serves age-adjusted TTLs and does not rewrite the edge entry', async () => {
+  const query = makeQuery('l2-no-rewrite.example');
+  const key = await __internals.makeCacheKey(query);
+  const storedAt = Date.now() - 100_000; // 100 seconds ago
+  let puts = 0;
+  await withGlobalRuntimeMocks(async () => {
+    const ctx = { waitUntil: (promise) => promise };
+    const res = await postQuery('l2-no-rewrite.example', 'l2-no-rewrite', ctx);
+    assert.equal(res.headers.get('x-cache'), 'L2-HIT');
+    const served = readAnswerTTL(new Uint8Array(await res.arrayBuffer()), query.length);
+    assert.ok(served <= 3500 && served >= 3498, `served TTL ${served}`);
+    assert.equal(puts, 0);
+  }, {
+    fetch: async () => { throw new Error('upstream must not be used'); },
+    caches: {
+      default: {
+        match: async (req) => (req.url.endsWith(key)
+          ? new Response(makeAResponse(query, 3600).buffer, {
+            headers: { 'x-doh-stored-at': String(storedAt), 'x-doh-ttl': '3600' }
+          })
+          : null),
+        put: async () => { puts += 1; }
+      }
+    }
+  });
+});
+test('a throwing ctx.waitUntil does not break a cache miss', async () => {
+  await withGlobalRuntimeMocks(async () => {
+    const res = await postQuery('bad-waituntil.example', 'bad-waituntil', {
+      waitUntil() { throw new Error('cannot schedule'); }
+    });
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('x-cache'), 'MISS');
+  }, {
+    fetch: async (_url, init) => new Response(makeAResponse(init.body, 60), {
+      status: 200,
+      headers: { 'content-type': 'application/dns-message' }
+    }),
+    caches: cacheMock()
+  });
+});
+test('patchDNSResponseForAge ages the SOA MINIMUM of negative answers', () => {
+  const query = makeQuery('soa-age.example');
+  const q = query.length;
+  const response = makeNxdomainWithSOA(query, 300, 45);
+  const aged = new Uint8Array(__internals.patchDNSResponseForAge(response, 0x1234, 10));
+  const u32 = (b, o) => ((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3]) >>> 0;
+  assert.equal(u32(aged, q + 6), 290); // SOA TTL
+  assert.equal(u32(aged, q + 36), 35); // SOA MINIMUM
+  // Ageing past the lifetime clamps both at zero rather than wrapping.
+  const expired = new Uint8Array(__internals.patchDNSResponseForAge(response, 0x1234, 1000));
+  assert.equal(u32(expired, q + 6), 0);
+  assert.equal(u32(expired, q + 36), 0);
+  // The source buffer is never modified.
+  assert.equal(u32(response, q + 36), 45);
+});
+test('patchDNSResponseForAge accepts ArrayBuffer and Uint8Array input without mutating it', () => {
+  const query = makeQuery('copy.example');
+  const view = makeAResponse(query, 100);
+  const snapshot = Array.from(view);
+  const fromView = new Uint8Array(__internals.patchDNSResponseForAge(view, 0x0a0b, 30));
+  const fromBuffer = new Uint8Array(__internals.patchDNSResponseForAge(view.buffer, 0x0a0b, 30));
+  assert.deepEqual(Array.from(fromView), Array.from(fromBuffer));
+  assert.equal(readAnswerTTL(fromView, query.length), 70);
+  assert.deepEqual(Array.from(view), snapshot);
+});
+test('parseDNSQuestion accepts a valid EDNS OPT query', () => {
+  assert.equal(__internals.parseDNSQuestion(withOPT(makeQuery('edns.example'))).ok, true);
+});
+test('parseDNSQuestion rejects an ARCOUNT larger than the records present', () => {
+  const parsed = __internals.parseDNSQuestion(withOPT(makeQuery('edns.example'), { arcount: 2 }));
+  assert.equal(parsed.ok, false);
+});
+test('parseDNSQuestion rejects an ARCOUNT of 0 with additional bytes present', () => {
+  const parsed = __internals.parseDNSQuestion(withOPT(makeQuery('edns.example'), { arcount: 0 }));
+  assert.equal(parsed.ok, false);
+  assert.match(parsed.error, /trailing/);
+});
+test('parseDNSQuestion rejects a truncated OPT record', () => {
+  const parsed = __internals.parseDNSQuestion(withOPT(makeQuery('edns.example'), { truncateBy: 3 }));
+  assert.equal(parsed.ok, false);
+  assert.match(parsed.error, /additional/i);
+});
+test('parseDNSQuestion rejects trailing data, with or without EDNS', () => {
+  const plain = Uint8Array.from([...makeQuery('trail.example'), 1, 2, 3]);
+  assert.match(__internals.parseDNSQuestion(plain).error, /trailing/);
+  const edns = withOPT(makeQuery('trail.example'), { extra: [9, 9] });
+  assert.equal(__internals.parseDNSQuestion(edns).ok, false);
+});
+test('parseDNSQuestion rejects multiple OPT records', () => {
+  const q = withOPT(makeQuery('two-opt.example'));
+  const doubled = Uint8Array.from([...q, 0, 0, 41, 0x10, 0, 0, 0, 0, 0, 0, 0]);
+  doubled[11] = 2;
+  assert.equal(__internals.parseDNSQuestion(doubled).ok, false);
+});
+test('malformed queries are rejected with 400 before any upstream request', async () => {
+  let fetched = 0;
+  await withGlobalRuntimeMocks(async () => {
+    const res = await worker.fetch(new Request('https://workers.example/dns-query', {
+      method: 'POST',
+      headers: { 'content-type': 'application/dns-message', 'cf-connecting-ip': 'bad-q' },
+      body: Uint8Array.from([...makeQuery('bad.example'), 7, 7])
+    }), {}, {});
+    assert.equal(res.status, 400);
+    assert.equal(fetched, 0);
+  }, { fetch: async () => { fetched += 1; throw new Error('no'); }, caches: cacheMock() });
+});
+test('validateDNSResponse rejects more than one question', () => {
+  const query = makeQuery('multi.example');
+  const response = Array.from(makeAResponse(query));
+  response[5] = 2;
+  assert.match(__internals.validateDNSResponse(Uint8Array.from(response), 0x1234, query).error, /questions/);
+});
+test('validateDNSResponse rejects trailing bytes', () => {
+  const query = makeQuery('trail.example');
+  const response = Uint8Array.from([...makeAResponse(query), 0, 0]);
+  const result = __internals.validateDNSResponse(response, 0x1234, query);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /trailing/);
+  assert.equal(__internals.validateDNSMessage(response).ok, false);
+});
+test('validateDNSResponse rejects invalid compression pointer targets', () => {
+  const query = makeQuery('ptr.example');
+  for (const target of [0x0000, 0x0005, query.length + 20, query.length]) {
+    const response = Array.from(makeAResponse(query));
+    response[query.length] = 0xc0 | (target >> 8);
+    response[query.length + 1] = target & 0xff;
+    assert.equal(__internals.validateDNSResponse(Uint8Array.from(response), 0x1234, query).ok, false,
+      `pointer to ${target} must be rejected`);
+  }
+  // A self-referencing / forward pointer is also invalid.
+  const loop = Array.from(makeAResponse(query));
+  loop[query.length] = 0xc0;
+  loop[query.length + 1] = query.length;
+  assert.equal(__internals.validateDNSResponse(Uint8Array.from(loop), 0x1234, query).ok, false);
+});
+test('validateDNSResponse still accepts a pointer to the question name', () => {
+  const query = makeQuery('ptr-ok.example');
+  assert.equal(__internals.validateDNSResponse(makeAResponse(query), 0x1234, query).ok, true);
+});
+test('malformed error responses are rejected, well-formed ones stay accepted', () => {
+  const query = makeQuery('err.example');
+  const good = makeAResponse(query, 0, 2); // SERVFAIL with question
+  assert.equal(__internals.validateDNSResponse(good, 0x1234, query).ok, true);
+  // SERVFAIL that omits the question entirely is still allowed.
+  const noQuestion = Uint8Array.from([0x12, 0x34, 0x81, 0x82, 0, 0, 0, 0, 0, 0, 0, 0]);
+  assert.equal(__internals.validateDNSResponse(noQuestion, 0x1234, query).ok, true);
+  // Declared record that is not present.
+  const missing = Array.from(good);
+  missing[7] = 1;
+  assert.match(__internals.validateDNSResponse(Uint8Array.from(missing), 0x1234, query).error, /Truncated/);
+  // Undeclared trailing bytes after an error response.
+  const trailing = Uint8Array.from([...good, 1, 2, 3]);
+  assert.match(__internals.validateDNSResponse(trailing, 0x1234, query).error, /trailing/);
 });

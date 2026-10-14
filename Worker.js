@@ -1,4 +1,4 @@
-const VERSION = '0.3.0';
+const VERSION = '0.3.2';
 const CONFIG = {
   DNS_PATH: '/dns-query',
   EDGE_CACHE_ENABLED: true,
@@ -119,15 +119,10 @@ async function handleDNS(req, url, ctx) {
           Math.min(edgeHit.remainingSeconds, CONFIG.LOCAL_CACHE_MAX_TTL_SECONDS),
           edgeHit.storedAt
         );
-        // Refresh the edge entry on hit so hot keys keep their remaining
-        // lifetime instead of lapsing into a re-resolution near expiry.
-        ctx?.waitUntil?.(putEdgeCache(
-          cacheKey,
-          edgeHit.body,
-          edgeHit.remainingSeconds,
-          Date.now(),
-          url.origin
-        ));
+        // No write-back on an L2 hit: re-putting the entry with its
+        // *remaining* TTL expires at the same instant as the original (and
+        // rounding the age down could only add sub-second drift), so it
+        // would cost a Cache API subrequest without extending anything.
         shared = {
           body: edgeHit.body,
           storedAt: edgeHit.storedAt,
@@ -174,7 +169,7 @@ async function handleDNS(req, url, ctx) {
             storedAt
           );
           if (CONFIG.EDGE_CACHE_ENABLED) {
-            ctx?.waitUntil?.(putEdgeCache(
+            runInBackground(ctx, putEdgeCache(
               cacheKey,
               result.body,
               ttlSeconds,
@@ -201,7 +196,9 @@ async function handleDNS(req, url, ctx) {
         // Fresh answer: the body already carries the correct ID and TTLs, so
         // it can be returned without an extra copy. Only the client QNAME
         // case (which upstreams need not echo, cf. 0x20) is restored, in
-        // place, on this private buffer.
+        // place. The buffer is shared with the L1 entry and coalesced
+        // joiners, which is safe: every later response re-applies its own
+        // client's case in patchDNSResponseForAge().
         restoreQuestionCase(new Uint8Array(result.body), payload);
         response = dnsResponse(result.body, headers);
       } catch (err) {
@@ -214,8 +211,17 @@ async function handleDNS(req, url, ctx) {
     settleJob.resolve(shared);
     return response;
   } finally {
+    // No-op when already settled. If anything unexpected threw above, this
+    // releases joiners (they answer 502) instead of leaving them awaiting a
+    // promise nobody will ever settle.
+    settleJob.reject(new Error('DNS resolution aborted'));
     if (APP_STATE.inflight.get(cacheKey) === job) APP_STATE.inflight.delete(cacheKey);
   }
+}
+function runInBackground(ctx, promise) {
+  // Scheduling the L2 write must never fail the client request or leave the
+  // in-flight job unsettled; putEdgeCache() already swallows its own errors.
+  try { ctx?.waitUntil?.(promise); } catch (_) {}
 }
 function l1Response(entry, queryID, queryBytes) {
   const ageSeconds = Math.max(0, Math.floor((Date.now() - entry.storedAt) / 1000));
@@ -363,9 +369,28 @@ function parseDNSQuestion(packet) {
   if (qdcount !== 1 || ancount !== 0 || nscount !== 0) {
     return { ok: false, error: 'Invalid DNS query section counts' };
   }
+  const arcount = (bytes[10] << 8) | bytes[11];
   const questionEnd = skipDNSName(bytes, 12, false);
   if (questionEnd < 0 || questionEnd + 4 > bytes.length) {
     return { ok: false, error: 'Incomplete DNS question' };
+  }
+  // Walk the declared additional records (valid EDNS OPT stays supported) and
+  // require the message to end exactly where they end.
+  let offset = questionEnd + 4;
+  let optCount = 0;
+  for (let i = 0; i < arcount; i++) {
+    const rr = readResourceRecord(bytes, offset);
+    if (!rr) return { ok: false, error: 'Malformed DNS additional record' };
+    if (rr.type === 41) {
+      // OPT: owner name must be the root and only one is allowed (RFC 6891).
+      if (bytes[offset] !== 0 || ++optCount > 1) {
+        return { ok: false, error: 'Invalid EDNS OPT record' };
+      }
+    }
+    offset = rr.rdEnd;
+  }
+  if (offset !== bytes.length) {
+    return { ok: false, error: 'Unexpected trailing bytes in DNS query' };
   }
   return { ok: true, id };
 }
@@ -586,6 +611,9 @@ function validateDNSMessage(responseBuffer, { expectedID = null, queryBytes = nu
   const ancount = (bytes[6] << 8) | bytes[7];
   const nscount = (bytes[8] << 8) | bytes[9];
   const arcount = (bytes[10] << 8) | bytes[11];
+  // Queries are always single-question, so a response may carry at most one
+  // question (zero is tolerated for error responses only, see below).
+  if (qdcount > 1) return { ok: false, error: 'DNS response has too many questions' };
   let offset = 12;
   let question = null;
   for (let i = 0; i < qdcount; i++) {
@@ -613,19 +641,18 @@ function validateDNSMessage(responseBuffer, { expectedID = null, queryBytes = nu
     const match = matchQuestion(bytes, question, queryBytes);
     if (!match.ok) return match;
   }
-  // Walk every resource record so a valid-header-but-garbage-body answer can
-  // neither be served nor cached. Error answers may carry short/garbage
-  // records; those stay usable-but-degraded instead of failing the attempt.
-  let recordsComplete = true;
-  sectionWalk: for (const count of [ancount, nscount, arcount]) {
+  // Walk every declared resource record. Error responses may omit their
+  // question, but their declared records must still be structurally valid,
+  // and no response may carry undeclared trailing bytes.
+  for (const count of [ancount, nscount, arcount]) {
     for (let i = 0; i < count; i++) {
       const rr = readResourceRecord(bytes, offset);
-      if (!rr) { recordsComplete = false; break sectionWalk; }
+      if (!rr) return { ok: false, error: 'Truncated DNS resource record' };
       offset = rr.rdEnd;
     }
   }
-  if (!recordsComplete && rcode === 0) {
-    return { ok: false, error: 'Truncated DNS resource record' };
+  if (offset !== bytes.length) {
+    return { ok: false, error: 'Unexpected trailing bytes in DNS response' };
   }
   return { ok: true, rcode, truncated };
 }
@@ -805,6 +832,8 @@ function skipDNSName(bytes, offset, allowPointer = true) {
     if (len === 0) return pos + 1;
     if ((len & 0xc0) === 0xc0) {
       if (!allowPointer || pos + 1 >= bytes.length) return -1;
+      const target = ((len & 0x3f) << 8) | bytes[pos + 1];
+      if (!isValidNamePointerTarget(bytes, target, pos)) return -1;
       return pos + 2;
     }
     if ((len & 0xc0) !== 0 || pos + 1 + len > bytes.length) return -1;
@@ -813,6 +842,35 @@ function skipDNSName(bytes, offset, allowPointer = true) {
     pos += 1 + len;
   }
   return -1;
+}
+// A compression pointer must point backwards into the message body (never
+// into the header, itself or forward, which also rules out loops) at a
+// well-formed name: labels in bounds, terminating in a root label or another
+// valid backward pointer, within the 255-byte wire limit.
+function isValidNamePointerTarget(bytes, target, pointerPos) {
+  let wireLength = 1;
+  let from = pointerPos;
+  let pos = target;
+  for (let hops = 0; hops < 128; hops++) {
+    if (pos < 12 || pos >= from) return false;
+    for (;;) {
+      if (pos >= bytes.length) return false;
+      const len = bytes[pos];
+      if (len === 0) return true;
+      if (pos >= from) return false;
+      if ((len & 0xc0) === 0xc0) {
+        if (pos + 1 >= bytes.length) return false;
+        from = pos;
+        pos = ((len & 0x3f) << 8) | bytes[pos + 1];
+        break;
+      }
+      if ((len & 0xc0) !== 0 || pos + 1 + len > bytes.length) return false;
+      wireLength += len + 1;
+      if (wireLength > 255) return false;
+      pos += 1 + len;
+    }
+  }
+  return false;
 }
 function readResourceRecord(bytes, offset) {
   const nameEnd = skipDNSName(bytes, offset);
@@ -845,6 +903,12 @@ function findSOAMinimumOffset(bytes, rdataOffset, rdEnd) {
 function readUint32(bytes, offset) {
   return (((bytes[offset] * 0x100 + bytes[offset + 1]) * 0x100 + bytes[offset + 2]) * 0x100 + bytes[offset + 3]) >>> 0;
 }
+function writeUint32(bytes, offset, value) {
+  bytes[offset] = (value >>> 24) & 0xff;
+  bytes[offset + 1] = (value >>> 16) & 0xff;
+  bytes[offset + 2] = (value >>> 8) & 0xff;
+  bytes[offset + 3] = value & 0xff;
+}
 function restoreQuestionCase(target, query) {
   const lower = (v) => (v >= 65 && v <= 90 ? v + 32 : v);
   let offset = 12;
@@ -861,9 +925,11 @@ function restoreQuestionCase(target, query) {
   }
 }
 function patchDNSResponseForAge(responseBuffer, queryID, ageSeconds, queryBytes) {
-  const bytes = new Uint8Array(responseBuffer);
-  const copy = new Uint8Array(bytes.length);
-  copy.set(bytes);
+  const source = responseBuffer instanceof Uint8Array
+    ? responseBuffer
+    : new Uint8Array(responseBuffer);
+  // slice() yields an exact-length private copy in a single pass.
+  const copy = source.slice();
   if (copy.length < 12) return copy.buffer;
   copy[0] = (queryID >> 8) & 0xff;
   copy[1] = queryID & 0xff;
@@ -880,16 +946,25 @@ function patchDNSResponseForAge(responseBuffer, queryID, ageSeconds, queryBytes)
     offset += 4;
   }
   const counts = [ancount, nscount, arcount];
-  for (const count of counts) {
-    for (let i = 0; i < count; i++) {
+  for (let section = 0; section < counts.length; section++) {
+    for (let i = 0; i < counts[section]; i++) {
       const rr = readResourceRecord(copy, offset);
       if (!rr) return copy.buffer;
       if (rr.type !== 41) {
-        const remaining = Math.max(0, rr.ttl - ageSeconds);
-        copy[rr.rdataOffset - 6] = (remaining >>> 24) & 0xff;
-        copy[rr.rdataOffset - 5] = (remaining >>> 16) & 0xff;
-        copy[rr.rdataOffset - 4] = (remaining >>> 8) & 0xff;
-        copy[rr.rdataOffset - 3] = remaining & 0xff;
+        writeUint32(copy, rr.rdataOffset - 6, Math.max(0, rr.ttl - ageSeconds));
+        // A negative answer's lifetime is min(SOA TTL, SOA MINIMUM)
+        // (RFC 2308). Ageing only the TTL would let clients keep the full
+        // MINIMUM, so age it too (authority section only: an SOA *answer*
+        // to an SOA query is zone data, not a cache lifetime).
+        if (section === 1 && rr.type === 6) {
+          const minimumOffset = findSOAMinimumOffset(copy, rr.rdataOffset, rr.rdEnd);
+          if (minimumOffset >= 0) {
+            const minimum = readUint32(copy, minimumOffset);
+            if (minimum <= 0x7fffffff) {
+              writeUint32(copy, minimumOffset, Math.max(0, minimum - ageSeconds));
+            }
+          }
+        }
       }
       offset = rr.rdEnd;
     }
@@ -1155,7 +1230,6 @@ export const __internals = {
   localRateLimit,
   selectRacers,
   setCache,
-  resetResolverState,
   resetAppState,
   hasInflight: (key) => APP_STATE.inflight.has(key)
 };

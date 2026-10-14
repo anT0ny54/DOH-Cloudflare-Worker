@@ -18,7 +18,7 @@ No other DNS upstreams or resolver profiles are used by the Worker. (The "Free D
 
 ### Cloudflare limits and how this build uses them
 
-Cloudflare's current Workers Free limits are 100,000 requests/day, 10 ms CPU time/invocation, 128 MB memory, 50 subrequests/invocation, and 6 simultaneous outgoing connections per invocation. Free requests reset at midnight UTC, and Cloudflare also applies a burst limit to Free accounts (documented as 1,000 requests per minute at the time of writing). Cache API calls share the subrequest quota; check the current Cloudflare Workers Limits documentation for the exact per-request numbers, which Cloudflare has changed before. This Worker makes at most one Cache API `match` and one `put` per request.
+Cloudflare's current Workers Free limits are 100,000 requests/day, 10 ms CPU time/invocation, 128 MB memory, 50 subrequests/invocation, and 6 simultaneous outgoing connections per invocation. Free requests reset at midnight UTC, and Cloudflare also applies a burst limit to Free accounts (documented as 1,000 requests per minute at the time of writing). Cache API calls share the subrequest quota; check the current Cloudflare Workers Limits documentation for the exact per-request numbers, which Cloudflare has changed before. This Worker makes at most one Cache API `match` and one `put` per request (plus a best-effort `delete` in the rare case it purges an expired or corrupt entry). An L2 hit does not write back to the cache.
 
 This Worker deliberately stays far below those ceilings on ordinary DNS traffic:
 
@@ -33,10 +33,10 @@ The resolver logic never launches all three upstreams immediately. In-flight dup
 
 #### Resolver selection and hedging
 
-- Each resolver starts with a score of 100 (range 0-100). A usable answer (`NOERROR`/`NXDOMAIN`) gives +1, a failure (HTTP error, response that is too short, oversized, not marked as a response or whose transaction ID does not match, or a `SERVFAIL`/`REFUSED`/other RCODE) gives -12, and a timeout gives -8. Aborting a slower attempt after another resolver won is not penalised. The Worker validates the response header only (length, QR bit, transaction ID); it does not compare the echoed question section with the query.
+- Each resolver starts with a score of 100 (range 0-100). A usable answer (`NOERROR`/`NXDOMAIN`) gives +1, a failure (HTTP error, a redirect (upstream redirects are never followed), response that is too short, oversized, not marked as a response, whose transaction ID does not match or that is truncated (TC), or a `SERVFAIL`/`REFUSED`/other RCODE) gives -12, and a timeout gives -8. Aborting a slower attempt after another resolver won is not penalised. The Worker validates each upstream response structurally: length, QR bit, transaction ID, at most one question, and an echoed question that matches the query's QNAME (case-insensitively), QTYPE and QCLASS. A `NOERROR` answer must carry the question; only error responses may omit it. Every declared answer/authority/additional record must be complete, compression pointers must point backwards at a well-formed name, and the message must end exactly where its declared sections end. Error responses (`SERVFAIL`, `REFUSED`, ...) may omit the question section, but their declared records must still be well-formed with no trailing bytes. Remaining edge cases: a compression pointer is checked to land on a parseable name, not on a verified record boundary, and RDATA contents other than SOA are not interpreted.
 - The first resolver is chosen round-robin among resolvers whose score is within 8 points of the best one; the rest follow in score/latency order.
 - A backup is started if the first attempt has not answered after `1.5 x` its learned latency (clamped to 80-220 ms, so the 120 ms assumed before any sample gives 180 ms) or as soon as it fails. The last-resort resolver is started after a further 150 ms, or immediately when the first two have both failed. The delay timer restarts whenever any attempt settles, so these delays are measured from the most recent event rather than from the start of the request.
-- Each upstream attempt is aborted after 1200 ms. If no resolver produces a usable answer but at least one returned a DNS message with an error code such as `SERVFAIL`, the last such answer is relayed to the client (`x-dns-degraded: 1`); if none returns a DNS message at all, the client gets `502`.
+- Each upstream attempt is aborted after 1200 ms. A truncated (TC) answer is treated as unusable so that a resolver returning a complete answer wins. If no resolver produces a usable answer but at least one returned a DNS message with an error code such as `SERVFAIL` (or only truncated answers), the last such answer is relayed to the client (`x-dns-degraded: 1`); if none returns a DNS message at all, the client gets `502`.
 - Scores only change when a resolver is actually queried; there is no time-based recovery. A resolver that falls more than 8 points behind the best one is no longer picked first and regains points only when it is used as a backup. A `SERVFAIL` for a genuinely broken domain makes the Worker try all three resolvers and lowers all three scores by 12; the same applies to any other non-`NOERROR`/`NXDOMAIN` answer, such as a `FORMERR` for a query that passed the Worker's structural checks but that the resolvers reject.
 - Scores, counters, the L1 cache and the in-flight table live in each isolate's memory. They are not shared between isolates or data centers, and `/health` shows only the state of the isolate that answered it.
 
@@ -50,7 +50,7 @@ Both DoH GET and POST requests use the same cache key: the first 128 bits of the
 
 Only DNS answers that are safe to reuse are cached: `NOERROR` and `NXDOMAIN` responses that are not truncated (TC) and are at most 65,535 bytes. Negative answers (`NXDOMAIN`/`NODATA`) are cached only when they carry an SOA record; the TTL is the smaller of the lowest authority-section record TTL (which includes the SOA TTL) and the SOA `MINIMUM` field, per RFC 2308. Record TTLs with the top bit set are treated as 0 (RFC 2181), so such answers are not cached; the SOA `MINIMUM` field gets the same treatment. For positive (`NOERROR`) answers the cache TTL is the minimum across all sections present in the response (answer, authority and additional, excluding OPT), not just the answer section, so a short-lived authority record cannot be over-cached. `SERVFAIL`, `REFUSED` and similar responses are relayed to the client (marked `x-dns-degraded: 1`) but never cached.
 
-Responses cached internally use DNS TTL-derived expiration. The response transaction ID is rewritten for each client, and cached DNS record TTLs are reduced by cache age before being returned. An L2 hit also refreshes the edge entry (re-`put` with its remaining TTL), so hot keys do not lapse into avoidable re-resolutions as their TTL runs down. `Cache-Control: no-store` remains on the client-facing response so the Worker controls the DNS cache instead of creating an uncontrolled browser/HTTP cache layer.
+Responses cached internally use DNS TTL-derived expiration. The response transaction ID is rewritten for each client, and cached DNS record TTLs are reduced by cache age before being returned; for cached negative answers the SOA `MINIMUM` field in the authority section is aged the same way, so clients do not keep a negative answer longer than its remaining lifetime. An L2 hit is not written back: the entry simply expires at its original time and is then re-resolved (a hit is promoted to L1 with its remaining TTL). `Cache-Control: no-store` remains on the client-facing response so the Worker controls the DNS cache instead of creating an uncontrolled browser/HTTP cache layer.
 
 ### Rate limiting
 
@@ -62,7 +62,7 @@ DoH DNS messages are normally tiny, so this Worker rejects client messages large
 
 ### Query validation
 
-Before any cache or upstream work, the Worker checks that the client message is a plausible single-question DNS query: at least 12 bytes, QR bit clear, opcode 0, `QDCOUNT` = 1 with no answer or authority records, and a complete, well-formed question name (labels of at most 63 bytes, at most 255 bytes on the wire) followed by 4 bytes of type/class. A **compression pointer in the question name is rejected with `400`**: a query's only question has nothing earlier to point to, so a pointer is never valid, and forwarding it would make all three resolvers answer `FORMERR` and lower every resolver score by 12 for a single malformed request. Compression pointers remain supported when the Worker parses *responses*.
+Before any cache or upstream work, the Worker checks that the client message is a plausible single-question DNS query: at least 12 bytes, QR bit clear, opcode 0, `QDCOUNT` = 1 with no answer or authority records, and a complete, well-formed question name (labels of at most 63 bytes, at most 255 bytes on the wire) followed by 4 bytes of type/class. Any `ARCOUNT` additional records are then walked and must be complete: a single valid EDNS OPT record (root owner name) is accepted, while a wrong `ARCOUNT`, a truncated or duplicate OPT record, or undeclared trailing bytes are rejected with `400` before any cache or upstream work, so malformed requests no longer cost resolvers a score penalty. A **compression pointer in the question name is rejected with `400`**: a query's only question has nothing earlier to point to, so a pointer is never valid, and forwarding it would make all three resolvers answer `FORMERR` and lower every resolver score by 12 for a single malformed request. Compression pointers remain supported when the Worker parses *responses*.
 
 ## Deploy with Wrangler
 
@@ -89,7 +89,7 @@ https://YOUR-DOMAIN.example/dns-query
 | `/`, `/index.html` | Setup dashboard (EN / FA / ZH). Its Tailwind utilities are pre-compiled and inlined in a `<style>` block (no external CDN dependency); the DoH endpoint itself does not depend on it. Served with a restrictive Content-Security-Policy that includes `frame-ancestors 'none'`, so the page cannot be embedded in a frame |
 | anything else | `404` |
 
-`/dns-query` status codes: `200` DNS message, `400` malformed query (including a compressed question name) or missing `dns` parameter, `405` method other than GET/POST, `413` message larger than 4 KiB (or a GET `dns` parameter longer than 5,462 characters), `415` POST without `application/dns-message`, `429` rate limit exceeded (`Retry-After: 60`), `502` all upstreams failed (the `x-upstreams` header counts the attempts made by *this* request: a request that joined another request's failed in-flight resolution reports `0`). The rate-limit check runs first, so a client over the limit receives `429` even when its request would otherwise have been a `405`, `400` or `413`.
+`/dns-query` status codes: `200` DNS message, `400` malformed query (including a compressed question name, malformed EDNS/additional records or trailing bytes), invalid base64url, or missing `dns` parameter, `405` method other than GET/POST, `413` message larger than 4 KiB (or a GET `dns` parameter longer than 5,462 characters), `415` POST without `application/dns-message`, `429` rate limit exceeded (`Retry-After: 60`), `502` all upstreams failed (the `x-upstreams` header counts the attempts made by *this* request: a request that joined another request's failed in-flight resolution reports `0`). The rate-limit check runs first, so a client over the limit receives `429` even when its request would otherwise have been a `405`, `400` or `413`.
 
 ## DoH methods
 
@@ -111,7 +111,7 @@ Content-Type: application/dns-message
 
 ## Cloudflare Worker notes
 
-The L1 cache is a per-isolate LRU (512 entries, lifetime capped at 300 s or the record's remaining TTL, whichever is shorter). Entries found in L2 are promoted to L1 using their *remaining* TTL, so hot long-TTL names are served from memory even when the L2 entry is older than 300 s. Identical concurrent cache misses within one isolate share a single upstream resolution; if that resolution fails, every waiting request receives the same `502`. L1 is checked again after an L2 miss, so a request that waited on the Cache API while another request filled L1 is answered from memory (`x-cache: L1-HIT`) instead of starting a redundant upstream query. L2 Cache API entries can honor authoritative TTLs up to 24 hours, reducing unnecessary upstream resolutions for long-lived DNS records. The per-isolate state (L1 cache, in-flight table, resolver scores, fallback limiter) is lost when the isolate is recycled. Correctness never depends on the Cache API: if L2 is unavailable, misses, or fails, requests fall through to the upstream resolvers. Expired isolate-local cache and throttle entries are swept periodically so `/health` does not retain stale bounded state indefinitely.
+The L1 cache is a per-isolate LRU (512 entries, lifetime capped at 300 s or the record's remaining TTL, whichever is shorter). Entries found in L2 are promoted to L1 using their *remaining* TTL, so hot long-TTL names are served from memory even when the L2 entry is older than 300 s. Identical concurrent cache misses within one isolate share a single upstream resolution; if that resolution fails (or is aborted by an unexpected error), every waiting request receives a `502`. L1 is checked again after an L2 miss, so a request that waited on the Cache API while another request filled L1 is answered from memory (`x-cache: L1-HIT`) instead of starting a redundant upstream query. L2 Cache API entries can honor authoritative TTLs up to 24 hours, reducing unnecessary upstream resolutions for long-lived DNS records. The per-isolate state (L1 cache, in-flight table, resolver scores, fallback limiter) is lost when the isolate is recycled. Correctness never depends on the Cache API: if L2 is unavailable, misses, or fails, requests fall through to the upstream resolvers. Expired isolate-local cache and throttle entries are swept periodically so `/health` does not retain stale bounded state indefinitely.
 
 For a production deployment, attach the Worker to a custom domain and use:
 
@@ -131,7 +131,7 @@ Run the included Node.js unit tests from the project folder. Use Node.js 22 or n
 npm test        # or: node --test
 ```
 
-The suite (47 tests) mocks `fetch` and the Cache API, so it needs no network or Cloudflare account.
+The suite (75 tests) mocks `fetch` and the Cache API, so it needs no network or Cloudflare account.
 
 ### Verifying a deployment
 
@@ -155,8 +155,8 @@ Useful response headers include:
 x-cache: L1-HIT / L2-HIT / COALESCED / MISS
 x-edge-cache: HIT / MISS / SKIP / DISABLED   (DISABLED only if EDGE_CACHE_ENABLED is set to false in CONFIG)
 x-upstreams: 0 / 1 / 2 / 3
-x-winner: <haGeZi-upstream-url>      (MISS and COALESCED only)
-x-winner-lat: <latency>               (MISS and COALESCED only)
+x-winner: <haGeZi-upstream-url>      (MISS, and COALESCED when the shared request went upstream)
+x-winner-lat: <latency>               (MISS, and COALESCED when the shared request went upstream)
 x-dns-degraded: 1   (only when the answer is SERVFAIL/REFUSED/etc.)
 ```
 

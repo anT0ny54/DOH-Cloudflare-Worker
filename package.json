@@ -1,8 +1,11 @@
 {
   "name": "doh-cloudflare-worker",
-  "version": "0.2.9",
+  "version": "0.3.2",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "test": "node --test"
   }

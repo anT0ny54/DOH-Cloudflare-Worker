@@ -1512,3 +1512,33 @@ test('resolver scores stay inside [SCORE_MIN, SCORE_MAX]', async () => {
     assert.ok(__internals.getHealthSnapshot().upstreams.every((u) => u.score === CFG.SCORE_MIN));
   }, { fetch: async () => { throw new Error('down'); }, caches: cacheMock() });
 });
+test('a joiner attaches to a leader inside the three-sequential-timeout window', async () => {
+  let calls = 0;
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  await withGlobalRuntimeMocks(async () => {
+    const leader = postQuery('join-window.example', 'join-window-1');
+    await waitForInflight('join-window.example');
+    // Age the leader's entry to 3 s: above 0.5.2's 2500 ms join timeout but
+    // below 0.5.3's 4000 ms one and inside the 3600 ms worst case of three
+    // sequential upstream timeouts. A correct implementation still attaches
+    // the joiner to it; 0.5.2 would fork a duplicate upstream resolution.
+    const entry = __internals.inflightEntry(makeQuery('join-window.example'));
+    entry.createdAt -= 3000;
+    const joiner = postQuery('join-window.example', 'join-window-2');
+    await waitForJoiners('join-window.example', 1);
+    release();
+    const [leaderRes, joinerRes] = await Promise.all([leader, joiner]);
+    assert.equal(leaderRes.status, 200);
+    assert.equal(joinerRes.status, 200);
+    assert.equal(joinerRes.headers.get('x-cache'), 'COALESCED');
+    assert.equal(calls, 1);
+  }, {
+    fetch: async (_url, init) => {
+      calls += 1;
+      await gate;
+      return okResponse(init);
+    },
+    caches: cacheMock()
+  });
+});

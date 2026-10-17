@@ -3,6 +3,23 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.3] - 2026-10-17
+
+### Fixed
+- The in-flight join timeout (2.5 s) was shorter than the worst-case duration
+  of the resolution a joiner waits for: three sequential upstream timeouts
+  take 3 x 1200 ms = 3.6 s. When every upstream was degraded, each waiting
+  request gave up at 2.5 s and started its own full three-upstream resolution,
+  duplicating upstream traffic exactly when the upstreams were least able to
+  absorb it. The join timeout is now 4 s, above that worst case. The comment
+  that claimed a worst case of "~220 + 150 + 1200 ms" (the hedging path only)
+  is corrected.
+
+### Tests
+- 113 tests (1 new): a joiner whose leader is still inside the
+  three-sequential-timeout window attaches to it instead of forking a
+  duplicate resolution. The new test fails against 0.5.2.
+
 ## [0.5.2] - 2026-10-15
 
 ### Fixed
@@ -37,4 +54,3 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   exception for GET and POST with malformed options, and resolver scores
   staying within `SCORE_MIN`..`SCORE_MAX`. The first and third of these fail
   against 0.5.1.
-

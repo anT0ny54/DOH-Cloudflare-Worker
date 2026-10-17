@@ -68,6 +68,7 @@ export const __internals = {
   resetAppState,
   hasInflight: (query) => APP_STATE.inflight.has(localKeyOf(query)),
   joinerCount: (query) => APP_STATE.inflight.get(localKeyOf(query))?.joiners ?? 0,
+  inflightEntry: (query) => APP_STATE.inflight.get(localKeyOf(query)) ?? null,
   injectInflight: (query, entry) => APP_STATE.inflight.set(localKeyOf(query), entry)
 };
 `;

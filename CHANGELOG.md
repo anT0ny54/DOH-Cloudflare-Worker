@@ -69,3 +69,4 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   exception for GET and POST with malformed options, and resolver scores
   staying within `SCORE_MIN`..`SCORE_MAX`. The first and third of these fail
   against 0.5.1.
+

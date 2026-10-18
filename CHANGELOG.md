@@ -3,6 +3,21 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Documentation
+- README: added the missing request-size detail that a GET `dns` parameter
+  longer than 5,462 characters is rejected before decoding; documented the
+  fallback limiter's 256-entry penalty map; noted the 128-key bound on the
+  in-flight coalescing table in the cache section; and mentioned that the
+  dashboard template is built once and cached at module scope (a small CPU
+  optimization for repeat visits to `/`).
+
+### Verified
+- Re-audit found no dead code, no redundant code, no conflicting logic, and
+  no remaining defects. Every CONFIG key is used, every exported helper is
+  referenced by tests, and all documentation matches implementation.
+
 ## [0.5.3] - 2026-10-17
 
 ### Fixed

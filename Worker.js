@@ -1,4 +1,4 @@
-const VERSION = '0.5.3';
+const VERSION = '0.5.7';
 const CONFIG = {
   DNS_PATH: '/dns-query',
   EDGE_CACHE_ENABLED: true,
@@ -347,8 +347,12 @@ function decodeBase64Url(input) {
   }
 }
 function encodeBase64Url(bytes) {
+  // Build the binary string in chunks: byte-by-byte concatenation allocates a
+  // new string for every input byte before btoa() ever runs.
   let binary = '';
-  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  for (let i = 0; i < bytes.length; i += 8192) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+  }
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 function parseDNSQuestion(packet) {
@@ -374,7 +378,9 @@ function parseDNSQuestion(packet) {
     return { ok: false, error: 'Invalid DNS query section counts' };
   }
   const arcount = (bytes[10] << 8) | bytes[11];
-  const nameBoundaries = new Set();
+  // Most queries carry no additional records, so they need no pointer-target
+  // bookkeeping at all. The question itself is uncompressed (allowPointer=false).
+  const nameBoundaries = arcount ? new Set() : null;
   const questionEnd = skipDNSName(bytes, 12, false, nameBoundaries);
   if (questionEnd < 0 || questionEnd + 4 > bytes.length) {
     return { ok: false, error: 'Incomplete DNS question' };
@@ -522,14 +528,15 @@ async function resolveWithHedging(nodes, packet, expectedID, questionEnd) {
   }
 }
 async function raceAttempts(active, timeoutMs) {
-  const racers = [...active.values()];
-  if (timeoutMs == null) return Promise.race(racers);
+  // Promise.race() accepts the map iterator directly; do not copy the active
+  // attempts into an intermediate array when no hedge timer participates.
+  if (timeoutMs == null) return Promise.race(active.values());
   let timeoutId;
   const timer = new Promise((resolve) => {
     timeoutId = setTimeout(() => resolve(HEDGE_TIMER), timeoutMs);
   });
   try {
-    return await Promise.race([timer, ...racers]);
+    return await Promise.race([timer, ...active.values()]);
   } finally {
     clearTimeout(timeoutId);
   }
@@ -610,7 +617,9 @@ async function relay(node, packet, encodedQuery, expectedID, signal, questionEnd
       degraded: !usable
     };
   } catch (err) {
-    if (signal.aborted && !timeoutSignal.aborted) throw err;
+    // A winner-selected abort must win even if the attempt timeout fired first;
+    // otherwise a slow loser could be recorded as a timeout.
+    if (signal.aborted) throw err;
     if (timeoutSignal.aborted) {
       node.timeout += 1;
       penalize(node, CONFIG.SCORE_TIMEOUT_DELTA, 'timeout', false);
@@ -861,13 +870,18 @@ function localCacheKey(keyBytes) {
   }
   return out;
 }
+const HEX_DIGITS = '0123456789abcdef';
 // L2 key: first 128 bits of SHA-256 over the key bytes, computed only after
-// an L1 miss.
+// an L1 miss. A nibble table hex-encodes the digest without the per-byte
+// string allocations of toString(16).padStart(2, '0').
 async function edgeCacheKey(keyBytes) {
   const digest = await crypto.subtle.digest('SHA-256', keyBytes);
   const view = new Uint8Array(digest, 0, 16);
   let out = '';
-  for (let i = 0; i < view.length; i++) out += view[i].toString(16).padStart(2, '0');
+  for (let i = 0; i < view.length; i++) {
+    const b = view[i];
+    out += HEX_DIGITS[b >> 4] + HEX_DIGITS[b & 15];
+  }
   return out;
 }
 function deleteCache(key) {
@@ -1112,16 +1126,32 @@ function validateKnownRdata(bytes, rr, nameBoundaries = null) {
     case 49: // DHCID: identifier type, digest type, digest
     case 52: case 53: // TLSA/SMIMEA: usage, selector, matching type, association data
       return length >= 4;
-    case 45: { // IPSECKEY: validate the defined gateway field framing.
+    case 45: { // IPSECKEY: validate defined gateway framing and null-key length.
       if (length < 3) return false;
       const gatewayType = bytes[start + 1];
       const gatewayStart = start + 3;
-      if (gatewayType === 0) return true;
-      if (gatewayType === 1) return gatewayStart + 4 <= end;
-      if (gatewayType === 2) return gatewayStart + 16 <= end;
-      if (gatewayType === 3) return rdataNameEndAt(bytes, gatewayStart, end, false, nameBoundaries) >= 0;
-      // Leave unrecognized gateway types opaque for future extensions.
-      return true;
+      let gatewayEnd;
+      if (gatewayType === 0) {
+        // Even with "no gateway", the required gateway field is the root name.
+        if (gatewayStart >= end || bytes[gatewayStart] !== 0) return false;
+        gatewayEnd = gatewayStart + 1;
+      } else if (gatewayType === 1) {
+        gatewayEnd = gatewayStart + 4;
+        if (gatewayEnd > end) return false;
+      } else if (gatewayType === 2) {
+        gatewayEnd = gatewayStart + 16;
+        if (gatewayEnd > end) return false;
+      } else if (gatewayType === 3) {
+        gatewayEnd = rdataNameEndAt(bytes, gatewayStart, end, false, nameBoundaries);
+        if (gatewayEnd < 0) return false;
+      } else {
+        // Leave unrecognized gateway types opaque for future extensions.
+        return true;
+      }
+      // Gateway types 0-3 have known boundaries, so algorithm 0 ("no public
+      // key") must end exactly after the gateway field. Other algorithms may
+      // have arbitrary-length public-key material after it.
+      return bytes[start + 2] !== 0 || gatewayEnd === end;
     }
 
     case 257: { // CAA: flags, non-empty ASCII alphanumeric tag, value
@@ -1158,7 +1188,7 @@ function validateKnownRdata(bytes, rr, nameBoundaries = null) {
         pos += 4;
         const valueStart = pos;
         const valueEnd = pos + valueLength;
-        if (key <= previousKey || key === 65535 || valueEnd > end) return false;
+        if (key === 0 || key <= previousKey || key === 65535 || valueEnd > end) return false;
         previousKey = key;
         keys.add(key);
 
@@ -1353,6 +1383,11 @@ function maybeSweepState() {
   }
   for (const [ip, stats] of APP_STATE.penalty) {
     if (now >= stats.resetAt) APP_STATE.penalty.delete(ip);
+  }
+  // A lost job's never-settling promise can leave its entry behind forever;
+  // it is stale once joiners would no longer wait for it.
+  for (const [key, entry] of APP_STATE.inflight) {
+    if (now - entry.createdAt > CONFIG.INFLIGHT_JOIN_TIMEOUT_MS) APP_STATE.inflight.delete(key);
   }
   APP_STATE.lastSweepAt = now;
 }
@@ -1649,12 +1684,12 @@ function buildUITemplate() {
         </section>
         <!-- TUTORIAL SECTION -->
         <div class="mb-16">
-            <nav id="tutorialNav" class="flex flex-wrap gap-3 justify-center mb-8">
+            <nav class="flex flex-wrap gap-3 justify-center mb-8">
                 <button onclick="tab('chrome', this)" id="btnC" class="btn-tab px-6 py-3 rounded-2xl text-[11px] font-black uppercase text-slate-400 nav-active">Chrome / Brave / Edge</button>
                 <button onclick="tab('firefox', this)" id="btnF" class="btn-tab px-6 py-3 rounded-2xl text-[11px] font-black uppercase text-slate-400">Firefox</button>
                 <button onclick="tab('mobile', this)" id="btnM" class="btn-tab px-6 py-3 rounded-2xl text-[11px] font-black uppercase text-slate-400">Android / iOS</button>
             </nav>
-            <section id="docPanels" class="min-h-[300px]">
+            <section class="min-h-[300px]">
                 <!-- Chrome/Edge Panel -->
                 <div id="chrome" class="panel panel-active cyber-glass p-10 md:p-14 rounded-[3rem]">
                     <h3 class="text-2xl font-black mb-8 text-cyan-100" id="cH">Chromium Browser Settings</h3>

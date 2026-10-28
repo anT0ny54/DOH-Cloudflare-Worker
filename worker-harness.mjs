@@ -67,6 +67,7 @@ export const __internals = {
     penalty: APP_STATE.penalty.has(rateLimitKey(ip))
   }),
   selectRacers,
+  relay,
   setCache: (key, body, ttl, storedAt = Date.now(), metadata = null) =>
     setCache(key, body, ttl, storedAt, metadata ?? metadataOf(body)),
   resetAppState,

@@ -221,6 +221,8 @@ test('validateDNSResponse rejects compressed targets in DNAME, KX, LP and IPSECK
     makeRecordResponse(query, 36, [0, 10, 0xc0, 0x0c]), // KX exchange name cannot be compressed.
     makeRecordResponse(query, 39, [0xc0, 0x0c]), // DNAME target names cannot be compressed.
     makeRecordResponse(query, 45, [10, 3, 2, 0xc0, 0x0c, 1]), // IPSECKEY gateway cannot be compressed.
+    makeRecordResponse(query, 45, [10, 0, 2, 1, 2, 3]), // Gateway type 0 still requires the root gateway field.
+    makeRecordResponse(query, 45, [10, 3, 0, 0, 1, 2, 3]), // Algorithm 0 must not carry a public key.
     makeRecordResponse(query, 58, [0xc0, 0x0c, 0xc0, 0x0c]), // TALINK names cannot be compressed.
     makeRecordResponse(query, 107, [0, 10, 0xc0, 0x0c]) // LP FQDN cannot be compressed.
   ];
@@ -231,6 +233,8 @@ test('validateDNSResponse rejects compressed targets in DNAME, KX, LP and IPSECK
   }
   const validIPSECKEY = makeRecordResponse(query, 45, [10, 3, 2, 0, 1, 2, 3]);
   assert.equal(__internals.validateDNSResponse(validIPSECKEY, 0x1234, query).ok, true);
+  const validNullGatewayIPSECKEY = makeRecordResponse(query, 45, [10, 0, 2, 0, 1, 2, 3]);
+  assert.equal(__internals.validateDNSResponse(validNullGatewayIPSECKEY, 0x1234, query).ok, true);
 });
 test('validateDNSResponse validates CAA tags, SPF strings and defined SVCB parameters', () => {
   const query = makeQuery('typed-parameters.example');
@@ -238,6 +242,7 @@ test('validateDNSResponse validates CAA tags, SPF strings and defined SVCB param
     makeRecordResponse(query, 257, [0, 1, 1, 0]), // CAA tags must be ASCII alphanumeric.
     makeRecordResponse(query, 65, [0, 1, 0, 0, 3, 0, 1, 80]), // port must be exactly two octets.
     makeRecordResponse(query, 65, [0, 1, 0, 0, 0, 0, 2, 0, 3]), // mandatory key 3 is absent.
+    makeRecordResponse(query, 64, [0, 1, 0, 0, 0, 0, 1, 0]), // SvcParamKey 0 is reserved for mandatory.
     makeRecordResponse(query, 65, [0, 1, 0, 0, 2, 0, 1, 65]) // no-default-alpn is an empty flag.
   ];
   for (const response of malformed) {
@@ -1521,6 +1526,36 @@ test('method, GET size and content-length guards return precise errors', async (
   const req = new Request('https://workers.example/dns-query', { method: 'POST', headers: { 'content-type': 'application/dns-message', 'content-length': '4097' }, body: makeQuery('cl.example') });
   assert.equal((await worker.fetch(req, {}, {})).status, 413);
 });
+test('a simultaneous winner abort and attempt timeout is not recorded as a timeout', async () => {
+  const node = {
+    name: 'slow', url: 'https://slow.example/dns-query', score: 100,
+    ok: 0, fail: 0, timeout: 0, slow: 0,
+    lastLatencyMs: null, ewmaLatencyMs: null, lastError: null, lastScoreUpdateAt: 0
+  };
+  const query = makeQuery('winner-abort.example');
+  const winner = new AbortController();
+  const oldTimeoutMs = __internals.CONFIG.UPSTREAM_TIMEOUT_MS;
+  __internals.CONFIG.UPSTREAM_TIMEOUT_MS = 5;
+  try {
+    await withGlobalRuntimeMocks(async () => {
+      const pending = __internals.relay(
+        node, query, 'AAAA', (query[0] << 8) | query[1], winner.signal, query.length - 4
+      );
+      setTimeout(() => winner.abort(), 10);
+      await assert.rejects(pending, /late upstream rejection/);
+    }, {
+      fetch: () => new Promise((_resolve, reject) => {
+        setTimeout(() => reject(new Error('late upstream rejection')), 20);
+      })
+    });
+  } finally {
+    __internals.CONFIG.UPSTREAM_TIMEOUT_MS = oldTimeoutMs;
+  }
+  assert.equal(node.timeout, 0);
+  assert.equal(node.fail, 0);
+  assert.equal(node.score, 100);
+  assert.equal(node.lastError, null);
+});
 test('upstream timeouts are recorded', async () => {
   const old = __internals.CONFIG.UPSTREAM_TIMEOUT_MS;
   __internals.CONFIG.UPSTREAM_TIMEOUT_MS = 5;
@@ -1695,6 +1730,14 @@ test('a stale in-flight entry is ignored and replaced', async () => {
     const res = await postQuery('stale.example', 'stale');
     assert.equal(res.status, 200);
     assert.equal(res.headers.get('x-cache'), 'MISS');
+    assert.equal(__internals.hasInflight(query), false);
+    // The periodic sweep also removes an old never-settling entry whose key is
+    // never requested again, instead of leaving it in /health state forever.
+    __internals.resetAppState();
+    __internals.injectInflight(query, {
+      job: new Promise(() => {}), createdAt: Date.now() - CFG.INFLIGHT_JOIN_TIMEOUT_MS - 1, joiners: 0
+    });
+    await worker.fetch(new Request('https://workers.example/health'), {}, {});
     assert.equal(__internals.hasInflight(query), false);
   }, { fetch: async (_url, init) => okResponse(init), caches: cacheMock() });
 });

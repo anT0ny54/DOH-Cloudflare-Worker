@@ -6,12 +6,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [Unreleased]
 
 ### Fixed
+- Client queries and upstream DNS responses with the reserved DNS header Z bit
+  set are rejected before caching or relaying.
+- L2 cache entries are now purged when their headers or body cannot be read,
+  avoiding repeated failed reads of the same corrupt entry.
+- L2 cache bodies are stream-capped at the 65,535-byte DNS wire maximum
+  before buffering; oversized entries are purged and resolved upstream. The shared
+  DNS validator also rejects oversized messages directly.
+- The local fallback rate limiter checks evicted penalty entries before moving
+  them back into the LRU, so blocked clients cannot churn legitimate entries.
 - Upstream DNS response validation checks that EDNS OPT option headers and
   payloads exactly fill the OPT RDATA, so malformed options trigger resolver
   failover and cannot enter either cache.
-- DNS compression-pointer targets must have their entire encoded name before
-  the referring pointer. Previously, a target could start before the pointer
-  but consume its bytes or later bytes, allowing a malformed response to pass.
+- DNS compression pointers must target a previously verified DNS-name label
+  boundary as well as encode the complete target before the referring pointer.
+  Pointers into label payload bytes or opaque, unverified RDATA are rejected.
 - Malformed SOA RDATA is rejected instead of being accepted in a positive
   response when it cannot safely be interpreted for cache-TTL handling.
 - Questionless response validation now checks the final RCODE after EDNS OPT
@@ -22,8 +31,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   name-compression rules (including uncompressed DNAME, KX, TALINK, LP,
   NSAP-PTR and IPSECKEY names), and legacy SIG/NXT/PX compression compatibility.
 - CAA tags must contain only ASCII letters and digits. SVCB/HTTPS validation
-  checks selected defined SvcParam layouts and mandatory-key consistency while
-  preserving unknown parameter keys as opaque values.
+  checks selected defined ServiceMode SvcParam layouts and mandatory-key consistency,
+  while AliasMode ignores SvcParams as required by RFC 9460; unknown keys stay opaque.
 
 ### Performance
 - Shared the RDATA framing helpers across records instead of allocating several
@@ -41,20 +50,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   conservative bound, since hedged attempts overlap.
 
 ### Documentation
-- README test count corrected (121 -> 123) and the dashboard-template caching
-  description now matches the code (built lazily on first request, then cached).
-- README reflects the 123-test suite, documents typed RDATA checks and the
-  remaining compression-target boundary limitation, and keeps the current official
-  Workers limits documentation linked directly.
+- README test count now reflects the 130-test suite; dashboard-template caching
+  documentation matches the code (built lazily on first request, then cached).
+- README documents typed RDATA checks and verified compression-target boundaries,
+  and links the current official Workers limits documentation directly.
 
 ### Tests
-- 123 tests (10 added since 0.5.3): malformed upstream OPT option lengths,
+- 130 tests (17 added since 0.5.3): malformed upstream OPT option lengths,
   partial option headers and trailing partial headers are rejected; malformed
   responses trigger failover and are not cached; questionless extended-RCODE
   errors are checked correctly; compression targets that overlap their source
-  pointer, malformed SOA RDATA and malformed common RDATA layouts are rejected;
+  pointer or land inside a label payload (including query additional records),
+  while targets in prior validated RDATA names remain accepted; malformed SOA
+  RDATA and malformed common RDATA layouts are rejected;
   valid compressed CNAME/MX and legacy SIG/PX/NXT RDATA remain accepted;
   prohibited NSAP-PTR/DNAME/KX/TALINK/LP/IPSECKEY compression, invalid CAA
   tags and malformed selected SvcParams are rejected; valid uncompressed SIG,
-  SPF and SVCB RDATA are accepted.
+  SPF and SVCB RDATA are accepted. New regressions cover reserved DNS Z flags,
+  L2 body-read failures, oversized-cache streaming caps, AliasMode SvcParam handling
+  and penalty-map LRU churn.
 

@@ -367,11 +367,15 @@ function parseDNSQuestion(packet) {
   if ((flags & 0x7800) !== 0) {
     return { ok: false, error: 'Unsupported DNS opcode' };
   }
+  if ((flags & 0x0040) !== 0) {
+    return { ok: false, error: 'Reserved DNS Z flag must be zero' };
+  }
   if (qdcount !== 1 || ancount !== 0 || nscount !== 0) {
     return { ok: false, error: 'Invalid DNS query section counts' };
   }
   const arcount = (bytes[10] << 8) | bytes[11];
-  const questionEnd = skipDNSName(bytes, 12, false);
+  const nameBoundaries = new Set();
+  const questionEnd = skipDNSName(bytes, 12, false, nameBoundaries);
   if (questionEnd < 0 || questionEnd + 4 > bytes.length) {
     return { ok: false, error: 'Incomplete DNS question' };
   }
@@ -380,7 +384,7 @@ function parseDNSQuestion(packet) {
   let offset = questionEnd + 4;
   let optCount = 0;
   for (let i = 0; i < arcount; i++) {
-    const rr = readResourceRecord(bytes, offset);
+    const rr = readResourceRecord(bytes, offset, nameBoundaries);
     if (!rr) return { ok: false, error: 'Malformed DNS additional record' };
     if (rr.type === 41) {
       // OPT: owner name must be the root and only one is allowed (RFC 6891).
@@ -391,6 +395,8 @@ function parseDNSQuestion(packet) {
       if (!optionsWellFormed(bytes, rr.rdataOffset, rr.rdEnd)) {
         return { ok: false, error: 'Malformed EDNS options' };
       }
+    } else if (!validateKnownRdata(bytes, rr, nameBoundaries)) {
+      return { ok: false, error: 'Malformed DNS additional record RDATA' };
     }
     offset = rr.rdEnd;
   }
@@ -624,11 +630,15 @@ function validateDNSMessage(responseBuffer, { expectedID = null, queryBytes = nu
   const bytes = responseBuffer instanceof Uint8Array
     ? responseBuffer
     : new Uint8Array(responseBuffer);
+  if (bytes.length > CONFIG.MAX_UPSTREAM_DNS_MESSAGE_BYTES) {
+    return { ok: false, error: 'DNS response too large' };
+  }
   if (bytes.length < 12) return { ok: false, error: 'DNS response too short' };
   const id = (bytes[0] << 8) | bytes[1];
   const flags = (bytes[2] << 8) | bytes[3];
   let rcode = flags & 0x000f;
   if ((flags & 0x7800) !== 0) return { ok: false, error: 'Unsupported DNS response opcode' };
+  if ((flags & 0x0040) !== 0) return { ok: false, error: 'Reserved DNS Z flag must be zero' };
   const truncated = (flags & 0x0200) !== 0;
   if ((flags & 0x8000) === 0) return { ok: false, error: 'Expected a DNS response, got a query' };
   if (expectedID !== null && id !== expectedID) {
@@ -643,9 +653,12 @@ function validateDNSMessage(responseBuffer, { expectedID = null, queryBytes = nu
   if (qdcount > 1) return { ok: false, error: 'DNS response has too many questions' };
   let offset = 12;
   let question = null;
+  // Only offsets proven to be DNS-name label boundaries may be compression
+  // targets. Keep the set across the message as names are validated in order.
+  const nameBoundaries = new Set();
   for (let i = 0; i < qdcount; i++) {
     const nameStart = offset;
-    offset = skipDNSName(bytes, offset);
+    offset = skipDNSName(bytes, offset, true, nameBoundaries);
     if (offset < 0 || offset + 4 > bytes.length) {
       return { ok: false, error: 'Truncated DNS question section' };
     }
@@ -676,7 +689,7 @@ function validateDNSMessage(responseBuffer, { expectedID = null, queryBytes = nu
   const counts = [ancount, nscount, arcount];
   for (let section = 0; section < counts.length; section++) {
     for (let i = 0; i < counts[section]; i++) {
-      const rr = readResourceRecord(bytes, offset);
+      const rr = readResourceRecord(bytes, offset, nameBoundaries);
       if (!rr) return { ok: false, error: 'Truncated DNS resource record' };
       if (rr.type === 41) {
         if (section !== 2 || bytes[offset] !== 0 || ++optCount > 1) {
@@ -687,12 +700,12 @@ function validateDNSMessage(responseBuffer, { expectedID = null, queryBytes = nu
         }
         rcode |= bytes[rr.rdataOffset - 6] << 4;
       } else {
-        if (!validateKnownRdata(bytes, rr)) {
+        if (!validateKnownRdata(bytes, rr, nameBoundaries)) {
           return { ok: false, error: `Malformed DNS RDATA for type ${rr.type}` };
         }
         let recordTtl = rr.ttl;
         if (rr.type === 6) {
-          const mo = findSOAMinimumOffset(bytes, rr.rdataOffset, rr.rdEnd);
+          const mo = findSOAMinimumOffset(bytes, rr.rdataOffset, rr.rdEnd, nameBoundaries);
           if (mo < 0) return { ok: false, error: 'Malformed DNS SOA record' };
           if (section === 1) {
             const minimum = readUint32(bytes, mo);
@@ -882,19 +895,34 @@ function setCache(key, body, ttlSeconds, storedAt, metadata) {
     deleteCache(APP_STATE.cache.keys().next().value);
   }
 }
-function skipDNSName(bytes, offset, allowPointer = true) {
+function skipDNSName(bytes, offset, allowPointer = true, nameBoundaries = null) {
   let pos = offset;
   let wireLength = 1;
+  const labelStarts = nameBoundaries ? [] : null;
   while (pos < bytes.length) {
     const len = bytes[pos];
-    if (len === 0) return pos + 1;
+    if (len === 0) {
+      if (nameBoundaries) {
+        for (const start of labelStarts) nameBoundaries.add(start);
+        nameBoundaries.add(pos);
+      }
+      return pos + 1;
+    }
     if ((len & 0xc0) === 0xc0) {
       if (!allowPointer || pos + 1 >= bytes.length) return -1;
       const target = ((len & 0x3f) << 8) | bytes[pos + 1];
+      // Backward-looking bytes are not necessarily a name: a pointer into a
+      // label's payload could otherwise be mistaken for a valid root/label.
+      if (nameBoundaries && !nameBoundaries.has(target)) return -1;
       if (!isValidNamePointerTarget(bytes, target, pos, wireLength)) return -1;
+      if (nameBoundaries) {
+        for (const start of labelStarts) nameBoundaries.add(start);
+        nameBoundaries.add(pos);
+      }
       return pos + 2;
     }
     if ((len & 0xc0) !== 0 || pos + 1 + len > bytes.length) return -1;
+    if (labelStarts) labelStarts.push(pos);
     wireLength += len + 1;
     if (wireLength > 255) return -1;
     pos += 1 + len;
@@ -904,7 +932,8 @@ function skipDNSName(bytes, offset, allowPointer = true) {
 // A compression pointer must point backwards into the message body (never
 // into the header, itself or forward, which also rules out loops) at a
 // well-formed name: labels in bounds, terminating in a root label or another
-// valid backward pointer, within the 255-byte wire limit.
+// valid backward pointer, within the 255-byte wire limit. The caller's
+// boundary set additionally proves that its target starts at a parsed label.
 function isValidNamePointerTarget(bytes, target, pointerPos, wireLength = 1) {
   let from = pointerPos;
   let pos = target;
@@ -933,8 +962,8 @@ function isValidNamePointerTarget(bytes, target, pointerPos, wireLength = 1) {
   }
   return false;
 }
-function readResourceRecord(bytes, offset) {
-  const nameEnd = skipDNSName(bytes, offset);
+function readResourceRecord(bytes, offset, nameBoundaries = null) {
+  const nameEnd = skipDNSName(bytes, offset, true, nameBoundaries);
   if (nameEnd < 0 || nameEnd + 10 > bytes.length) return null;
   const type = (bytes[nameEnd] << 8) | bytes[nameEnd + 1];
   let ttl = readUint32(bytes, nameEnd + 4);
@@ -945,10 +974,10 @@ function readResourceRecord(bytes, offset) {
   if (rdEnd > bytes.length) return null;
   return { type, ttl, rdataOffset, rdEnd };
 }
-function findSOAMinimumOffset(bytes, rdataOffset, rdEnd) {
-  let pos = skipDNSName(bytes, rdataOffset);
+function findSOAMinimumOffset(bytes, rdataOffset, rdEnd, nameBoundaries = null) {
+  let pos = skipDNSName(bytes, rdataOffset, true, nameBoundaries);
   if (pos < 0 || pos >= rdEnd) return -1;
-  pos = skipDNSName(bytes, pos);
+  pos = skipDNSName(bytes, pos, true, nameBoundaries);
   // Require exactly the five 32-bit fields after the two names. Trailing or
   // missing bytes mean malformed SOA data that must never drive the negative-
   // cache lifetime; MINIMUM is the last of those five fixed fields.
@@ -957,18 +986,18 @@ function findSOAMinimumOffset(bytes, rdataOffset, rdEnd) {
 }
 // These helpers are shared across records to avoid allocating several small
 // closures for every RR in an upstream response.
-function rdataNameEndAt(bytes, offset, end, allowPointer = true) {
+function rdataNameEndAt(bytes, offset, end, allowPointer = true, nameBoundaries = null) {
   if (offset < 0 || offset >= end) return -1;
-  const next = skipDNSName(bytes, offset, allowPointer);
+  const next = skipDNSName(bytes, offset, allowPointer, nameBoundaries);
   return next >= 0 && next <= end ? next : -1;
 }
-function rdataOneName(bytes, start, end, offset = start, allowPointer = true) {
-  return rdataNameEndAt(bytes, offset, end, allowPointer) === end;
+function rdataOneName(bytes, start, end, offset = start, allowPointer = true, nameBoundaries = null) {
+  return rdataNameEndAt(bytes, offset, end, allowPointer, nameBoundaries) === end;
 }
-function rdataTwoNames(bytes, start, end, offset = start, allowPointer = true) {
-  const first = rdataNameEndAt(bytes, offset, end, allowPointer);
+function rdataTwoNames(bytes, start, end, offset = start, allowPointer = true, nameBoundaries = null) {
+  const first = rdataNameEndAt(bytes, offset, end, allowPointer, nameBoundaries);
   if (first < 0) return false;
-  return rdataNameEndAt(bytes, first, end, allowPointer) === end;
+  return rdataNameEndAt(bytes, first, end, allowPointer, nameBoundaries) === end;
 }
 function rdataCharStringEnd(bytes, offset, end) {
   if (offset < 0 || offset >= end) return -1;
@@ -994,7 +1023,7 @@ function validRdataTypeBitmap(bytes, offset, end) {
 // opaque (their formats may be defined by extensions the Worker does not know),
 // but common fixed-size and domain-name-bearing records must not smuggle a
 // malformed name or field sequence into a response that can be relayed/cached.
-function validateKnownRdata(bytes, rr) {
+function validateKnownRdata(bytes, rr, nameBoundaries = null) {
   const { type, rdataOffset: start, rdEnd: end } = rr;
   const length = end - start;
   switch (type) {
@@ -1006,29 +1035,29 @@ function validateKnownRdata(bytes, rr) {
     // RFC 1035 name-only RRs permit compression. NSAP-PTR is a later type
     // without a compression exception, so its target must remain uncompressed.
     case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12:
-      return rdataOneName(bytes, start, end);
+      return rdataOneName(bytes, start, end, start, true, nameBoundaries);
     case 23: case 39: // NSAP-PTR; DNAME target names must not be compressed.
-      return rdataOneName(bytes, start, end, start, false);
+      return rdataOneName(bytes, start, end, start, false, nameBoundaries);
 
     // Legacy MINFO/RP records permit compressed names. TALINK was defined
     // later and has no compression exception.
     case 14: case 17:
-      return rdataTwoNames(bytes, start, end);
+      return rdataTwoNames(bytes, start, end, start, true, nameBoundaries);
     case 58:
-      return rdataTwoNames(bytes, start, end, start, false);
+      return rdataTwoNames(bytes, start, end, start, false, nameBoundaries);
 
     // Preference field followed by a compression-permitted domain name.
     case 15: case 18: case 21:
-      return length >= 3 && rdataOneName(bytes, start, end, start + 2);
+      return length >= 3 && rdataOneName(bytes, start, end, start + 2, true, nameBoundaries);
     // KX and LP targets must not be compressed.
     case 36: case 107:
-      return length >= 3 && rdataOneName(bytes, start, end, start + 2, false);
+      return length >= 3 && rdataOneName(bytes, start, end, start + 2, false, nameBoundaries);
 
     case 26: // PX: preference, MAP822 name, MAPX400 name
-      return length >= 4 && rdataTwoNames(bytes, start, end, start + 2);
+      return length >= 4 && rdataTwoNames(bytes, start, end, start + 2, true, nameBoundaries);
 
     case 33: // SRV: priority, weight, port, uncompressed target
-      return length >= 7 && rdataOneName(bytes, start, end, start + 6, false);
+      return length >= 7 && rdataOneName(bytes, start, end, start + 6, false, nameBoundaries);
 
     case 35: { // NAPTR: order, preference, three character strings, replacement
       if (length < 8) return false;
@@ -1037,7 +1066,7 @@ function validateKnownRdata(bytes, rr) {
         pos = rdataCharStringEnd(bytes, pos, end);
         if (pos < 0) return false;
       }
-      return rdataOneName(bytes, start, end, pos, false);
+      return rdataOneName(bytes, start, end, pos, false, nameBoundaries);
     }
 
     case 13: { // HINFO has exactly two character strings.
@@ -1058,20 +1087,20 @@ function validateKnownRdata(bytes, rr) {
 
     case 24: { // SIG: tolerate historical compression for receiver compatibility.
       if (length < 20) return false;
-      const signerEnd = rdataNameEndAt(bytes, start + 18, end);
+      const signerEnd = rdataNameEndAt(bytes, start + 18, end, true, nameBoundaries);
       return signerEnd >= 0 && signerEnd < end;
     }
     case 46: { // RRSIG: signer name must not be compressed.
       if (length < 20) return false;
-      const signerEnd = rdataNameEndAt(bytes, start + 18, end, false);
+      const signerEnd = rdataNameEndAt(bytes, start + 18, end, false, nameBoundaries);
       return signerEnd >= 0 && signerEnd < end;
     }
     case 30: { // NXT: next name and legacy bitmap; tolerate historical compression.
-      const nextName = rdataNameEndAt(bytes, start, end);
+      const nextName = rdataNameEndAt(bytes, start, end, true, nameBoundaries);
       return nextName >= 0 && nextName < end;
     }
     case 47: { // NSEC: uncompressed next name followed by type bitmaps.
-      const nextName = rdataNameEndAt(bytes, start, end, false);
+      const nextName = rdataNameEndAt(bytes, start, end, false, nameBoundaries);
       return nextName >= 0 && validRdataTypeBitmap(bytes, nextName, end);
     }
 
@@ -1090,7 +1119,7 @@ function validateKnownRdata(bytes, rr) {
       if (gatewayType === 0) return true;
       if (gatewayType === 1) return gatewayStart + 4 <= end;
       if (gatewayType === 2) return gatewayStart + 16 <= end;
-      if (gatewayType === 3) return rdataNameEndAt(bytes, gatewayStart, end, false) >= 0;
+      if (gatewayType === 3) return rdataNameEndAt(bytes, gatewayStart, end, false, nameBoundaries) >= 0;
       // Leave unrecognized gateway types opaque for future extensions.
       return true;
     }
@@ -1108,10 +1137,14 @@ function validateKnownRdata(bytes, rr) {
       return true;
     }
 
-    case 64: case 65: { // SVCB/HTTPS: priority, uncompressed target, sorted SvcParams
+    case 64: case 65: { // SVCB/HTTPS: priority, uncompressed target, SvcParams
       if (length < 3) return false;
-      const targetEnd = rdataNameEndAt(bytes, start + 2, end, false);
+      const priority = (bytes[start] << 8) | bytes[start + 1];
+      const targetEnd = rdataNameEndAt(bytes, start + 2, end, false, nameBoundaries);
       if (targetEnd < 0) return false;
+      // RFC 9460 AliasMode (SvcPriority = 0) requires recipients to ignore
+      // SvcParams. Do not apply ServiceMode key-specific checks to these bytes.
+      if (priority === 0) return true;
       let pos = targetEnd;
       let previousKey = -1;
       const keys = new Set();
@@ -1224,10 +1257,13 @@ function makeEdgeCacheRequest(origin, key) {
   return new Request(`${origin}${CONFIG.EDGE_CACHE_PATH}/${key}`, { method: 'GET' });
 }
 async function getEdgeCache(key, origin, queryBytes, questionEnd, ctx) {
+  let cache = null;
+  let cacheKey = null;
+  let hit = null;
   try {
-    const cache = caches.default;
-    const cacheKey = makeEdgeCacheRequest(origin, key);
-    const hit = await cache.match(cacheKey);
+    cache = caches.default;
+    cacheKey = makeEdgeCacheRequest(origin, key);
+    hit = await cache.match(cacheKey);
     if (!hit) return null;
     const storedAt = Number(hit.headers.get('x-doh-stored-at'));
     const ttlSeconds = Number(hit.headers.get('x-doh-ttl'));
@@ -1245,7 +1281,19 @@ async function getEdgeCache(key, origin, queryBytes, questionEnd, ctx) {
       runInBackground(ctx, purgeEdgeCache(cache, cacheKey));
       return null;
     }
-    const body = await hit.arrayBuffer();
+    const declaredLength = Number(hit.headers.get('content-length'));
+    if (Number.isFinite(declaredLength) && declaredLength > CONFIG.MAX_UPSTREAM_DNS_MESSAGE_BYTES) {
+      throw new Error('Cached DNS response too large');
+    }
+    // Cache entries are internal but may be corrupt or have been written by
+    // another deployment. Enforce the DNS wire-size ceiling while streaming,
+    // before allocating an unbounded ArrayBuffer for validation.
+    const bodyBytes = await readCappedBody(
+      hit,
+      CONFIG.MAX_UPSTREAM_DNS_MESSAGE_BYTES,
+      'Cached DNS response too large'
+    );
+    const body = toExactArrayBuffer(bodyBytes);
     // Bookkeeping alone is not enough: validate the DNS message itself
     // (structure plus echoed question) so a corrupt body with plausible
     // headers is purged and re-resolved upstream instead of being served.
@@ -1263,6 +1311,13 @@ async function getEdgeCache(key, origin, queryBytes, questionEnd, ctx) {
       remainingSeconds: ttlSeconds - ageSeconds
     };
   } catch (_) {
+    // A cache entry whose body or headers cannot be read would otherwise be
+    // retried on every request until eviction. Purge it when a match was
+    // obtained; a failure of cache.match itself remains a normal cache miss.
+    if (cache && cacheKey && hit) {
+      discardBody(hit);
+      runInBackground(ctx, purgeEdgeCache(cache, cacheKey));
+    }
     return null;
   }
 }
@@ -1317,15 +1372,16 @@ async function allowDNSRequest(ip, env) {
 // `ip` must already be normalised by rateLimitKey() (allowDNSRequest does it).
 function localRateLimit(ip) {
   const now = Date.now();
-  // Rejected requests must not re-touch the entry: a flooding client would
-  // otherwise stay hot in the LRU table and evict legitimate clients.
+  // Check both maps before moving an evicted client back into the LRU table.
+  // Rejected requests must not re-touch either entry: otherwise a blocked
+  // client recovered from the penalty map can churn legitimate LRU entries.
   const live = APP_STATE.throttle.get(ip);
-  if (live && now < live.resetAt && live.count >= CONFIG.RATE_LIMIT_MAX_REQUESTS) {
+  let stats = live || APP_STATE.penalty.get(ip);
+  if (stats && now < stats.resetAt && stats.count >= CONFIG.RATE_LIMIT_MAX_REQUESTS) {
     return false;
   }
   // A window evicted by an LRU overflow survives in the penalty map, so
   // flooding the table (e.g. IPv6 /64 scanning) cannot reset a client's count.
-  let stats = live || APP_STATE.penalty.get(ip);
   if (!live) APP_STATE.penalty.delete(ip);
   if (!stats || now >= stats.resetAt) {
     stats = { count: 0, resetAt: now + CONFIG.RATE_LIMIT_WINDOW_MS };

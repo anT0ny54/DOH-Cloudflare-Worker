@@ -103,6 +103,16 @@ test('parseDNSQuestion accepts a standard A query', () => {
   const parsed = __internals.parseDNSQuestion(makeQuery('example.com'));
   assert.deepEqual(parsed, { ok: true, id: 0x1234, questionEnd: 25 });
 });
+test('parseDNSQuestion rejects additional-record pointers into label payload bytes', () => {
+  const query = [
+    0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 1,
+    4, 0, 0, 0, 0, 0, 0, 1, 0, 1,
+    0xc0, 13, 0, 10, 0, 1, 0, 0, 0, 0, 0, 0
+  ];
+  const parsed = __internals.parseDNSQuestion(Uint8Array.from(query));
+  assert.equal(parsed.ok, false);
+  assert.match(parsed.error, /additional record/i);
+});
 test('parseDNSQuestion rejects DNS responses', () => {
   const query = makeQuery('example.com');
   query[2] |= 0x80;
@@ -114,6 +124,36 @@ test('parseDNSQuestion rejects non-query opcodes', () => {
   const parsed = __internals.parseDNSQuestion(makeQuery('example.com', 0x1234, 0x0800));
   assert.equal(parsed.ok, false);
   assert.match(parsed.error, /opcode/i);
+});
+test('reserved DNS Z flag is rejected in queries and upstream responses', async () => {
+  const query = makeQuery('reserved-z.example');
+  const badQuery = query.slice();
+  badQuery[3] |= 0x40;
+  assert.equal(__internals.parseDNSQuestion(badQuery).ok, false);
+  assert.match(__internals.parseDNSQuestion(badQuery).error, /reserved.*Z/i);
+
+  const badResponse = makeAResponse(query, 60);
+  badResponse[3] |= 0x40;
+  const validation = __internals.validateDNSResponse(badResponse, 0x1234, query);
+  assert.equal(validation.ok, false);
+  assert.match(validation.error, /reserved.*Z/i);
+
+  let calls = 0;
+  await withGlobalRuntimeMocks(async () => {
+    const res = await postQuery('reserved-z.example', 'reserved-z-upstream');
+    assert.equal(res.status, 502);
+    assert.equal(res.headers.get('x-upstreams'), '3');
+    assert.equal(__internals.getHealthSnapshot().cacheEntries, 0);
+    assert.equal(calls, 3);
+  }, {
+    fetch: async (_url, init) => {
+      calls += 1;
+      const response = makeAResponse(init.body, 60);
+      response[3] |= 0x40;
+      return new Response(response, { headers: { 'content-type': 'application/dns-message' } });
+    },
+    caches: cacheMock()
+  });
 });
 test('makeCacheKey normalizes DNS name case and transaction IDs', async () => {
   const lower = await __internals.makeCacheKey(makeQuery('example.com', 0x1111));
@@ -211,6 +251,10 @@ test('validateDNSResponse validates CAA tags, SPF strings and defined SVCB param
   assert.equal(__internals.validateDNSResponse(validSPF, 0x1234, query).ok, true);
   const validSVCB = makeRecordResponse(query, 64, [0, 1, 0, 0, 3, 0, 2, 1, 187]); // target ., port=443
   assert.equal(__internals.validateDNSResponse(validSVCB, 0x1234, query).ok, true);
+  // AliasMode (priority 0) ignores SvcParams, even when they would fail the
+  // ServiceMode-specific value checks (here, a one-byte port parameter).
+  const aliasModeWithIgnoredParams = makeRecordResponse(query, 65, [0, 0, 0, 0, 3, 0, 1, 80]);
+  assert.equal(__internals.validateDNSResponse(aliasModeWithIgnoredParams, 0x1234, query).ok, true);
 });
 test('malformed upstream A RDATA triggers failover and is never cached', async () => {
   let calls = 0;
@@ -632,6 +676,20 @@ test('localRateLimit survives a table-overflow flood without a fresh window', ()
   // the penalty map: it must NOT get a fresh request window.
   assert.equal(__internals.localRateLimit(busy), false);
 });
+test('blocked clients in the penalty map do not churn the throttle LRU', () => {
+  const blocked = 'penalty-blocked-client';
+  const { CONFIG } = __internals;
+  for (let i = 0; i < CONFIG.RATE_LIMIT_MAX_REQUESTS; i++) {
+    assert.equal(__internals.localRateLimit(blocked), true);
+  }
+  assert.equal(__internals.localRateLimit(blocked), false);
+  for (let i = 0; i < CONFIG.MAX_THROTTLE_ENTRIES + 10; i++) {
+    __internals.localRateLimit(`penalty-filler-${i}`);
+  }
+  assert.deepEqual(__internals.rateLimitState(blocked), { throttle: false, penalty: true });
+  assert.equal(__internals.localRateLimit(blocked), false);
+  assert.deepEqual(__internals.rateLimitState(blocked), { throttle: false, penalty: true });
+});
 test('hedging: first resolver fails, second answers, third is never contacted', async () => {
   const calls = [];
   await withGlobalRuntimeMocks(async () => {
@@ -741,6 +799,86 @@ function makeAWithAuthority(query, answerTtl, authorityTtl) {
 test('getDNSCacheTTL uses the minimum TTL across all sections for positive answers', () => {
   const response = makeAWithAuthority(makeQuery('multi.example'), 100, 30);
   assert.equal(__internals.getDNSCacheTTL(response), 30);
+});
+test('oversized L2 cache bodies are capped while streaming and re-resolved', async () => {
+  const query = makeQuery('l2-oversized.example');
+  const key = await __internals.makeCacheKey(query);
+  let cancelled = false;
+  let deletes = 0;
+  let upstreamCalls = 0;
+  const oversizedBody = new ReadableStream({
+    start(controller) { controller.enqueue(new Uint8Array(65_536)); },
+    pull() {},
+    cancel() { cancelled = true; }
+  });
+  const oversized = new Response(oversizedBody, {
+    headers: {
+      'x-doh-stored-at': String(Date.now()),
+      'x-doh-ttl': '60'
+    }
+  });
+  assert.equal(
+    __internals.validateDNSMessage(new Uint8Array(65_536)).ok,
+    false,
+    'the shared validator rejects messages beyond the DNS wire-size maximum'
+  );
+  await withGlobalRuntimeMocks(async () => {
+    const res = await postQuery('l2-oversized.example', 'l2-oversized');
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('x-cache'), 'MISS');
+    assert.equal(cancelled, true);
+    assert.equal(deletes, 1);
+    assert.equal(upstreamCalls, 1);
+  }, {
+    fetch: async (_url, init) => {
+      upstreamCalls += 1;
+      return new Response(makeAResponse(init.body, 60), {
+        headers: { 'content-type': 'application/dns-message' }
+      });
+    },
+    caches: {
+      default: {
+        match: async (req) => req.url.endsWith(key) ? oversized : null,
+        delete: async () => { deletes += 1; },
+        put: async () => {}
+      }
+    }
+  });
+});
+test('L2 entries whose response body cannot be read are purged and re-resolved', async () => {
+  const key = await __internals.makeCacheKey(makeQuery('l2-read-fail.example'));
+  let matches = 0;
+  let deletes = 0;
+  let upstreamCalls = 0;
+  await withGlobalRuntimeMocks(async () => {
+    const res = await postQuery('l2-read-fail.example', 'l2-read-fail');
+    assert.equal(res.status, 200);
+    assert.equal(res.headers.get('x-cache'), 'MISS');
+    assert.equal(matches, 1);
+    assert.equal(deletes, 1);
+    assert.equal(upstreamCalls, 1);
+  }, {
+    fetch: async (_url, init) => {
+      upstreamCalls += 1;
+      return new Response(makeAResponse(init.body, 60), {
+        headers: { 'content-type': 'application/dns-message' }
+      });
+    },
+    caches: {
+      default: {
+        match: async (req) => {
+          if (!req.url.endsWith(key)) return null;
+          matches += 1;
+          return {
+            headers: new Headers({ 'x-doh-stored-at': String(Date.now()), 'x-doh-ttl': '300' }),
+            arrayBuffer: async () => { throw new Error('cache body read failed'); }
+          };
+        },
+        delete: async () => { deletes += 1; },
+        put: async () => {}
+      }
+    }
+  });
 });
 test('corrupt L2 entries are purged instead of being re-read forever', async () => {
   const query = makeQuery('corrupt.example');
@@ -1245,6 +1383,35 @@ test('validateDNSResponse rejects invalid compression pointer targets', () => {
 test('validateDNSResponse still accepts a pointer to the question name', () => {
   const query = makeQuery('ptr-ok.example');
   assert.equal(__internals.validateDNSResponse(makeAResponse(query), 0x1234, query).ok, true);
+});
+test('validateDNSResponse accepts compression targets in prior validated RDATA names', () => {
+  const query = makeQuery('alias.example');
+  const bytes = Array.from(query);
+  bytes[2] = 0x81;
+  bytes[3] = 0x80;
+  bytes[6] = 0;
+  bytes[7] = 2;
+  const target = [6, 116, 97, 114, 103, 101, 116, 7, 101, 120, 97, 109, 112, 108, 101, 0];
+  const targetOffset = query.length + 12;
+  bytes.push(0xc0, 0x0c, 0, 5, 0, 1, ...u32(60), 0, target.length, ...target);
+  bytes.push(0xc0 | ((targetOffset >> 8) & 0x3f), targetOffset & 0xff,
+    0, 1, 0, 1, ...u32(60), 0, 4, 93, 184, 216, 34);
+  const result = __internals.validateDNSResponse(Uint8Array.from(bytes), 0x1234, query);
+  assert.equal(result.ok, true, result.error);
+});
+test('validateDNSResponse rejects compression pointers into label payload bytes', () => {
+  // A zero byte inside a label's payload looks like a root label if a pointer
+  // targets it. It is not a legal DNS-name boundary and must not be followed.
+  const query = Uint8Array.from([
+    0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0,
+    4, 0, 0, 0, 0, 0, 0, 1, 0, 1
+  ]);
+  const response = Array.from(makeAResponse(query, 60));
+  response[query.length] = 0xc0;
+  response[query.length + 1] = 13; // Inside the 4-byte label body, not at a label.
+  const result = __internals.validateDNSResponse(Uint8Array.from(response), 0x1234, query);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /resource record/i);
 });
 test('validateDNSResponse rejects compression targets that overlap their pointer source', () => {
   // The label byte at offset 19 is 63. If followed as a name pointer target,

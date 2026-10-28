@@ -62,6 +62,10 @@ export const __internals = {
   readCappedBody,
   getHedgeDelay,
   localRateLimit: (ip) => localRateLimit(rateLimitKey(ip)),
+  rateLimitState: (ip) => ({
+    throttle: APP_STATE.throttle.has(rateLimitKey(ip)),
+    penalty: APP_STATE.penalty.has(rateLimitKey(ip))
+  }),
   selectRacers,
   setCache: (key, body, ttl, storedAt = Date.now(), metadata = null) =>
     setCache(key, body, ttl, storedAt, metadata ?? metadataOf(body)),

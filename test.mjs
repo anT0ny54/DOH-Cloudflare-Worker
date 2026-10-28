@@ -79,6 +79,23 @@ function makeAResponse(query, ttl = 100, rcode = 0) {
   bytes.push(93, 184, 216, 34);
   return new Uint8Array(bytes);
 }
+function makeRecordResponse(query, type, rdata, ttl = 60) {
+  const bytes = Array.from(query);
+  bytes[2] = 0x81;
+  bytes[3] = 0x80;
+  bytes[6] = 0;
+  bytes[7] = 1;
+  bytes[8] = bytes[9] = bytes[10] = bytes[11] = 0;
+  bytes.push(
+    0xc0, 0x0c,
+    (type >> 8) & 0xff, type & 0xff,
+    0, 1,
+    ...u32(ttl),
+    (rdata.length >> 8) & 0xff, rdata.length & 0xff,
+    ...rdata
+  );
+  return Uint8Array.from(bytes);
+}
 test('module exposes default fetch handler', () => {
   assert.equal(typeof worker.fetch, 'function');
 });
@@ -125,6 +142,94 @@ test('validateDNSResponse checks ID, response bit, and question echo', () => {
   assert.equal(__internals.validateDNSResponse(response, 0x9999).ok, false);
   // The response bit check survives when called without the original query.
   assert.equal(__internals.validateDNSResponse(response, 0x1234).ok, true);
+});
+test('validateDNSResponse rejects malformed common RDATA layouts', () => {
+  const query = makeQuery('rdata.example');
+  const malformed = [
+    makeRecordResponse(query, 1, [93, 184, 216]), // A must contain exactly 4 bytes.
+    makeRecordResponse(query, 28, new Array(15).fill(0)), // AAAA must contain exactly 16 bytes.
+    makeRecordResponse(query, 5, [0xff]), // CNAME RDATA must be one complete domain name.
+    makeRecordResponse(query, 15, [0, 10]), // MX preference without an exchange name.
+    makeRecordResponse(query, 16, [2, 65]), // TXT character string overruns RDATA.
+    makeRecordResponse(query, 33, [0, 0, 0, 0, 0, 0, 0xc0, 0x0c]), // SRV target must not be compressed.
+    makeRecordResponse(query, 46, [...new Array(18).fill(0), 0xc0, 0x0c, 1]), // RRSIG signer must not be compressed.
+    makeRecordResponse(query, 257, [0, 4, 3, 105]) // CAA tag length overruns RDATA.
+  ];
+  for (const response of malformed) {
+    const result = __internals.validateDNSResponse(response, 0x1234, query);
+    assert.equal(result.ok, false, `malformed type-specific RDATA accepted: ${Array.from(response).join(',')}`);
+    assert.match(result.error, /RDATA/);
+  }
+});
+test('validateDNSResponse accepts valid compressed legacy name RDATA', () => {
+  const query = makeQuery('cname-target.example');
+  const cname = makeRecordResponse(query, 5, [0xc0, 0x0c]);
+  assert.equal(__internals.validateDNSResponse(cname, 0x1234, query).ok, true);
+  const mx = makeRecordResponse(query, 15, [0, 10, 0xc0, 0x0c]);
+  assert.equal(__internals.validateDNSResponse(mx, 0x1234, query).ok, true);
+  const sig = makeRecordResponse(query, 24, [...new Array(18).fill(0), 0xc0, 0x0c, 1]);
+  assert.equal(__internals.validateDNSResponse(sig, 0x1234, query).ok, true);
+  const px = makeRecordResponse(query, 26, [0, 10, 0xc0, 0x0c, 0xc0, 0x0c]);
+  assert.equal(__internals.validateDNSResponse(px, 0x1234, query).ok, true);
+  const nxt = makeRecordResponse(query, 30, [0xc0, 0x0c, 1]);
+  assert.equal(__internals.validateDNSResponse(nxt, 0x1234, query).ok, true);
+});
+test('validateDNSResponse rejects compressed targets in DNAME, KX, LP and IPSECKEY', () => {
+  const query = makeQuery('compression-rules.example');
+  const malformed = [
+    makeRecordResponse(query, 23, [0xc0, 0x0c]), // NSAP-PTR is not compression-enabled.
+    makeRecordResponse(query, 36, [0, 10, 0xc0, 0x0c]), // KX exchange name cannot be compressed.
+    makeRecordResponse(query, 39, [0xc0, 0x0c]), // DNAME target names cannot be compressed.
+    makeRecordResponse(query, 45, [10, 3, 2, 0xc0, 0x0c, 1]), // IPSECKEY gateway cannot be compressed.
+    makeRecordResponse(query, 58, [0xc0, 0x0c, 0xc0, 0x0c]), // TALINK names cannot be compressed.
+    makeRecordResponse(query, 107, [0, 10, 0xc0, 0x0c]) // LP FQDN cannot be compressed.
+  ];
+  for (const response of malformed) {
+    const result = __internals.validateDNSResponse(response, 0x1234, query);
+    assert.equal(result.ok, false, `compressed target accepted: ${Array.from(response).join(',')}`);
+    assert.match(result.error, /RDATA/);
+  }
+  const validIPSECKEY = makeRecordResponse(query, 45, [10, 3, 2, 0, 1, 2, 3]);
+  assert.equal(__internals.validateDNSResponse(validIPSECKEY, 0x1234, query).ok, true);
+});
+test('validateDNSResponse validates CAA tags, SPF strings and defined SVCB parameters', () => {
+  const query = makeQuery('typed-parameters.example');
+  const malformed = [
+    makeRecordResponse(query, 257, [0, 1, 1, 0]), // CAA tags must be ASCII alphanumeric.
+    makeRecordResponse(query, 65, [0, 1, 0, 0, 3, 0, 1, 80]), // port must be exactly two octets.
+    makeRecordResponse(query, 65, [0, 1, 0, 0, 0, 0, 2, 0, 3]), // mandatory key 3 is absent.
+    makeRecordResponse(query, 65, [0, 1, 0, 0, 2, 0, 1, 65]) // no-default-alpn is an empty flag.
+  ];
+  for (const response of malformed) {
+    const result = __internals.validateDNSResponse(response, 0x1234, query);
+    assert.equal(result.ok, false, `malformed typed parameter accepted: ${Array.from(response).join(',')}`);
+    assert.match(result.error, /RDATA/);
+  }
+  const validCAA = makeRecordResponse(query, 257, [0, 3, 105, 115, 115, 101, 120]); // tag=iss, value=ex
+  assert.equal(__internals.validateDNSResponse(validCAA, 0x1234, query).ok, true);
+  const validSPF = makeRecordResponse(query, 99, [2, 118, 49]); // one TXT-style string: "v1"
+  assert.equal(__internals.validateDNSResponse(validSPF, 0x1234, query).ok, true);
+  const validSVCB = makeRecordResponse(query, 64, [0, 1, 0, 0, 3, 0, 2, 1, 187]); // target ., port=443
+  assert.equal(__internals.validateDNSResponse(validSVCB, 0x1234, query).ok, true);
+});
+test('malformed upstream A RDATA triggers failover and is never cached', async () => {
+  let calls = 0;
+  await withGlobalRuntimeMocks(async () => {
+    const res = await postQuery('bad-a-rdata.example', 'bad-a-rdata');
+    assert.equal(res.status, 502);
+    assert.equal(res.headers.get('x-upstreams'), '3');
+    assert.equal(__internals.getHealthSnapshot().cacheEntries, 0);
+    assert.equal(calls, 3);
+  }, {
+    fetch: async (_url, init) => {
+      calls += 1;
+      return new Response(makeRecordResponse(init.body, 1, [93, 184, 216]), {
+        status: 200,
+        headers: { 'content-type': 'application/dns-message' }
+      });
+    },
+    caches: cacheMock()
+  });
 });
 test('getDNSCacheTTL reads minimum answer TTL', () => {
   const response = makeAResponse(makeQuery('example.com'), 100);
@@ -629,7 +734,8 @@ test('getDNSCacheTTL treats SOA MINIMUM with the MSB set as zero (RFC 2181)', ()
 function makeAWithAuthority(query, answerTtl, authorityTtl) {
   const bytes = Array.from(makeAResponse(query, answerTtl));
   bytes[9] = 1; // nscount = 1 (an NS record in the authority section)
-  bytes.push(0xc0, 0x0c, 0, 2, 0, 1, ...u32(authorityTtl), 0, 0);
+  // Valid NS RDATA: a compressed name pointing to the question's QNAME.
+  bytes.push(0xc0, 0x0c, 0, 2, 0, 1, ...u32(authorityTtl), 0, 2, 0xc0, 0x0c);
   return new Uint8Array(bytes);
 }
 test('getDNSCacheTTL uses the minimum TTL across all sections for positive answers', () => {
@@ -720,6 +826,17 @@ test('validateDNSResponse rejects success answers without a question but accepts
   assert.equal(__internals.validateDNSResponse(stripQuestion(full), 0x1234, query).ok, false);
   const servfail = makeAResponse(query, 60, 2);
   assert.equal(__internals.validateDNSResponse(stripQuestion(servfail), 0x1234, query).ok, true);
+});
+test('questionless extended-RCODE errors are checked after parsing OPT', () => {
+  // Base RCODE 0 with an OPT extended RCODE of 1 is BADVERS (effective RCODE 16).
+  const response = Uint8Array.from([
+    0x12, 0x34, 0x81, 0x80, 0, 0, 0, 0, 0, 0, 0, 1,
+    0, 0, 41, 0x10, 0, 1, 0, 0, 0, 0, 0
+  ]);
+  const result = __internals.validateDNSResponse(response, 0x1234, makeQuery('extended-rcode.example'));
+  assert.equal(result.ok, true);
+  assert.equal(result.rcode, 16);
+  assert.equal(result.metadata.ttl, 0);
 });
 test('validateDNSResponse rejects successful answers with truncated record sections', () => {
   const query = makeQuery('truncated.example');
@@ -871,6 +988,17 @@ test('getDNSCacheTTL ignores SOA records with trailing or missing bytes', () => 
   const short = Array.from(valid);
   short[q + 11] = 26; // rdlength cuts into the MINIMUM field itself
   assert.equal(__internals.getDNSCacheTTL(new Uint8Array(short)), 0);
+});
+test('validateDNSResponse rejects malformed SOA RDATA even on positive answers', () => {
+  const query = makeQuery('bad-soa-positive.example');
+  const response = Array.from(makeAResponse(query, 60));
+  response[9] = 1; // One authority record.
+  // SOA must contain two domain names and five 32-bit fields; a root byte
+  // alone is not valid SOA RDATA even though the enclosing RR is complete.
+  response.push(0xc0, 0x0c, 0, 6, 0, 1, ...u32(300), 0, 1, 0);
+  const result = __internals.validateDNSResponse(Uint8Array.from(response), 0x1234, query);
+  assert.equal(result.ok, false);
+  assert.match(result.error, /SOA/);
 });
 function makeTruncatedResponse(query, rcode = 0) {
   const bytes = Array.from(query);
@@ -1037,6 +1165,54 @@ test('malformed queries are rejected with 400 before any upstream request', asyn
     assert.equal(fetched, 0);
   }, { fetch: async () => { fetched += 1; throw new Error('no'); }, caches: cacheMock() });
 });
+test('validateDNSResponse requires EDNS options to tile OPT RDATA exactly', () => {
+  const query = makeQuery('response-edns-framing.example');
+  const valid = Array.from(makeAResponse(query, 60));
+  const withOpt = (rdata) => {
+    const response = valid.slice();
+    response[11] = 1; // One additional OPT record.
+    response.push(
+      0, 0, 41, 0x10, 0, // Root owner, OPT type, UDP payload size 4096.
+      0, 0, 0, 0, // Extended RCODE, version, flags.
+      (rdata.length >> 8) & 0xff, rdata.length & 0xff,
+      ...rdata
+    );
+    return Uint8Array.from(response);
+  };
+  assert.equal(__internals.validateDNSResponse(withOpt([0, 12, 0, 2, 0, 0]), 0x1234, query).ok, true);
+  for (const bad of [
+    [0, 12, 0], // Partial option header.
+    [0, 12, 0, 2, 0], // Option data is one byte short.
+    [0, 12, 0, 223, 1, 2, 3, 4], // Declared option data overruns RDATA.
+    [0, 10, 0, 1, 7, 0, 12] // Valid option followed by a partial header.
+  ]) {
+    const result = __internals.validateDNSResponse(withOpt(bad), 0x1234, query);
+    assert.equal(result.ok, false, `RDATA ${bad} must be rejected`);
+    assert.match(result.error, /EDNS options/);
+  }
+});
+test('malformed upstream EDNS options trigger failover and are never cached', async () => {
+  let calls = 0;
+  await withGlobalRuntimeMocks(async () => {
+    const res = await postQuery('bad-upstream-edns.example', 'bad-upstream-edns');
+    assert.equal(res.status, 502);
+    assert.equal(res.headers.get('x-upstreams'), '3');
+    assert.equal(__internals.getHealthSnapshot().cacheEntries, 0);
+    assert.equal(calls, 3);
+  }, {
+    fetch: async (_url, init) => {
+      calls += 1;
+      const response = Array.from(makeAResponse(init.body, 60));
+      response[11] = 1; // One additional OPT record.
+      response.push(0, 0, 41, 0x10, 0, 0, 0, 0, 0, 0, 8, 0, 12, 0, 223, 1, 2, 3, 4);
+      return new Response(Uint8Array.from(response), {
+        status: 200,
+        headers: { 'content-type': 'application/dns-message' }
+      });
+    },
+    caches: cacheMock()
+  });
+});
 test('validateDNSResponse rejects more than one question', () => {
   const query = makeQuery('multi.example');
   const response = Array.from(makeAResponse(query));
@@ -1069,6 +1245,37 @@ test('validateDNSResponse rejects invalid compression pointer targets', () => {
 test('validateDNSResponse still accepts a pointer to the question name', () => {
   const query = makeQuery('ptr-ok.example');
   assert.equal(__internals.validateDNSResponse(makeAResponse(query), 0x1234, query).ok, true);
+});
+test('validateDNSResponse rejects compression targets that overlap their pointer source', () => {
+  // The label byte at offset 19 is 63. If followed as a name pointer target,
+  // its label body crosses the answer pointer and ends on the RR type's zero
+  // byte. A target name must be entirely encoded before the pointer.
+  const longLabel = makeQuery(`${'a'.repeat(6)}?${'a'.repeat(56)}`);
+  const overlappingLabel = makeAResponse(longLabel);
+  overlappingLabel[longLabel.length + 1] = 19;
+  assert.equal(__internals.validateDNSResponse(overlappingLabel, 0x1234, longLabel).ok, false);
+
+  // This second case places a pointer in the last byte of an earlier RR's
+  // RDATA. Its second byte would be the first byte of the current owner-name
+  // pointer, which is not a complete prior encoding.
+  const query = makeQuery('pointer-overlap.example');
+  const response = Array.from(query);
+  response[2] = 0x81;
+  response[3] = 0x80;
+  response[7] = 2; // Two answer records.
+  const rdata = new Uint8Array(4020);
+  const firstRecordStart = query.length;
+  const secondOwnerOffset = firstRecordStart + 12 + rdata.length;
+  const target = secondOwnerOffset - 1;
+  rdata[rdata.length - 1] = 0xc0 | ((target >> 8) & 0x3f);
+  response.push(
+    0xc0, 0x0c, 0, 16, 0, 1, ...u32(60),
+    (rdata.length >> 8) & 0xff, rdata.length & 0xff,
+    ...rdata,
+    0xc0 | ((target >> 8) & 0x3f), target & 0xff,
+    0, 1, 0, 1, ...u32(60), 0, 4, 93, 184, 216, 34
+  );
+  assert.equal(__internals.validateDNSResponse(Uint8Array.from(response), 0x1234, query).ok, false);
 });
 test('malformed error responses are rejected, well-formed ones stay accepted', () => {
   const query = makeQuery('err.example');

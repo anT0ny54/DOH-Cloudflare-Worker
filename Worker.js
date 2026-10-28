@@ -11,10 +11,10 @@ const CONFIG = {
   MAX_INFLIGHT_ENTRIES: 128,
   // A joiner waits at most this long for another request's resolution, and an
   // in-flight entry older than this is treated as lost (its owner may have
-  // been cancelled). The slowest possible resolution is three sequential
-  // upstream timeouts (3 x UPSTREAM_TIMEOUT_MS = 3600 ms); the join timeout
-  // must stay above that, or every joiner duplicates a full resolution
-  // exactly when the upstreams are degraded.
+  // been cancelled). Attempts overlap through hedging, so a real resolution
+  // ends well within 3 x UPSTREAM_TIMEOUT_MS = 3600 ms (a conservative bound);
+  // the join timeout must stay above that, or every joiner duplicates a full
+  // resolution exactly when the upstreams are degraded.
   INFLIGHT_JOIN_TIMEOUT_MS: 4000,
   // Must match [ratelimits.simple] in wrangler.toml (a test enforces this).
   RATE_LIMIT_WINDOW_MS: 60_000,
@@ -101,8 +101,9 @@ export default {
   }
 };
 async function handleDNS(req, url, ctx) {
-  const methodError = validateMethod(req.method);
-  if (methodError) return methodError;
+  if (req.method !== 'GET' && req.method !== 'POST') {
+    return dnsErrorResponse('Method not allowed', 405, { allow: 'GET, POST, OPTIONS' });
+  }
   let payload;
   try {
     payload = await readDNSPayload(req, url);
@@ -254,7 +255,7 @@ function sharedDNSResponse(shared, parsed, queryBytes, tag) {
     'x-upstreams': String(own ? shared.attempts : 0)
   };
   if (shared.url) {
-    headers['x-winner'] = sanitizeHeaderValue(shared.url);
+    headers['x-winner'] = shared.url;
     headers['x-winner-lat'] = `${shared.latencyMs}ms`;
   }
   if (shared.degraded) headers['x-dns-degraded'] = '1';
@@ -262,12 +263,6 @@ function sharedDNSResponse(shared, parsed, queryBytes, tag) {
 }
 function upstreamFailureResponse(attempts) {
   return dnsErrorResponse('Global resolving failed', 502, { 'x-upstreams': String(attempts) });
-}
-function validateMethod(method) {
-  if (method !== 'GET' && method !== 'POST') {
-    return dnsErrorResponse('Method not allowed', 405, { allow: 'GET, POST, OPTIONS' });
-  }
-  return null;
 }
 async function readDNSPayload(req, url) {
   if (req.method === 'GET') {
@@ -664,12 +659,9 @@ function validateDNSMessage(responseBuffer, { expectedID = null, queryBytes = nu
     }
     offset += 4;
   }
-  if (!question) {
-    // Error responses (SERVFAIL, REFUSED, ...) may legitimately omit the
-    // question section. A usable answer, NOERROR or NXDOMAIN, may not: it
-    // would be unverifiable and unsafe to cache under the query's key.
-    if (rcode === 0 || rcode === 3) return { ok: false, error: 'DNS response missing question section' };
-  } else if (queryBytes) {
+  // A questionless response can be accepted only if its final RCODE is an
+  // error; the extended RCODE is not known until OPT has been parsed below.
+  if (question && queryBytes) {
     // Callers pass the parsed question end of the original query.
     const match = matchQuestion(bytes, question, queryBytes, questionEnd);
     if (!match.ok) return match;
@@ -690,12 +682,19 @@ function validateDNSMessage(responseBuffer, { expectedID = null, queryBytes = nu
         if (section !== 2 || bytes[offset] !== 0 || ++optCount > 1) {
           return { ok: false, error: 'Invalid EDNS OPT record' };
         }
+        if (!optionsWellFormed(bytes, rr.rdataOffset, rr.rdEnd)) {
+          return { ok: false, error: 'Malformed EDNS options' };
+        }
         rcode |= bytes[rr.rdataOffset - 6] << 4;
       } else {
+        if (!validateKnownRdata(bytes, rr)) {
+          return { ok: false, error: `Malformed DNS RDATA for type ${rr.type}` };
+        }
         let recordTtl = rr.ttl;
-        if (section === 1 && rr.type === 6) {
+        if (rr.type === 6) {
           const mo = findSOAMinimumOffset(bytes, rr.rdataOffset, rr.rdEnd);
-          if (mo >= 0) {
+          if (mo < 0) return { ok: false, error: 'Malformed DNS SOA record' };
+          if (section === 1) {
             const minimum = readUint32(bytes, mo);
             const cappedMinimum = minimum > 0x7fffffff ? 0 : minimum;
             soaMin = Math.min(soaMin, cappedMinimum);
@@ -709,6 +708,12 @@ function validateDNSMessage(responseBuffer, { expectedID = null, queryBytes = nu
     }
   }
   if (offset !== bytes.length) return { ok: false, error: 'Unexpected trailing bytes in DNS response' };
+  // Check the final RCODE after OPT has contributed any extended RCODE bits.
+  // Otherwise a questionless BADVERS (base RCODE 0, extended RCODE 1) would
+  // be mistaken for a usable NOERROR answer and rejected incorrectly.
+  if (!question && (rcode === 0 || rcode === 3)) {
+    return { ok: false, error: 'DNS response missing question section' };
+  }
   let ttl = Math.min(recordMin, soaMin);
   if (truncated || (rcode !== 0 && rcode !== 3)
       || ((rcode === 3 || ancount === 0) && soaMin === Infinity)
@@ -904,19 +909,23 @@ function isValidNamePointerTarget(bytes, target, pointerPos, wireLength = 1) {
   let from = pointerPos;
   let pos = target;
   for (let hops = 0; hops < 128; hops++) {
-    if (pos < 12 || pos >= from) return false;
+    if (pos < 12) return false;
     for (;;) {
-      if (pos >= bytes.length) return false;
+      // The complete target name must be encoded before the pointer that
+      // references it. Checking only the first byte allowed a label or a
+      // nested pointer to consume bytes at/after the referencing pointer.
+      if (pos >= from || pos >= bytes.length) return false;
       const len = bytes[pos];
       if (len === 0) return true;
-      if (pos >= from) return false;
       if ((len & 0xc0) === 0xc0) {
-        if (pos + 1 >= bytes.length) return false;
+        if (pos + 2 > from || pos + 1 >= bytes.length) return false;
         from = pos;
         pos = ((len & 0x3f) << 8) | bytes[pos + 1];
         break;
       }
-      if ((len & 0xc0) !== 0 || pos + 1 + len > bytes.length) return false;
+      if ((len & 0xc0) !== 0 || pos + 1 + len > from || pos + 1 + len > bytes.length) {
+        return false;
+      }
       wireLength += len + 1;
       if (wireLength > 255) return false;
       pos += 1 + len;
@@ -946,6 +955,235 @@ function findSOAMinimumOffset(bytes, rdataOffset, rdEnd) {
   if (pos < 0 || pos + 20 !== rdEnd) return -1;
   return pos + 16;
 }
+// These helpers are shared across records to avoid allocating several small
+// closures for every RR in an upstream response.
+function rdataNameEndAt(bytes, offset, end, allowPointer = true) {
+  if (offset < 0 || offset >= end) return -1;
+  const next = skipDNSName(bytes, offset, allowPointer);
+  return next >= 0 && next <= end ? next : -1;
+}
+function rdataOneName(bytes, start, end, offset = start, allowPointer = true) {
+  return rdataNameEndAt(bytes, offset, end, allowPointer) === end;
+}
+function rdataTwoNames(bytes, start, end, offset = start, allowPointer = true) {
+  const first = rdataNameEndAt(bytes, offset, end, allowPointer);
+  if (first < 0) return false;
+  return rdataNameEndAt(bytes, first, end, allowPointer) === end;
+}
+function rdataCharStringEnd(bytes, offset, end) {
+  if (offset < 0 || offset >= end) return -1;
+  const next = offset + 1 + bytes[offset];
+  return next <= end ? next : -1;
+}
+function validRdataTypeBitmap(bytes, offset, end) {
+  let pos = offset;
+  let previousWindow = -1;
+  while (pos < end) {
+    if (pos + 2 > end) return false;
+    const window = bytes[pos++];
+    const bitmapLength = bytes[pos++];
+    if (window <= previousWindow || bitmapLength < 1 || bitmapLength > 32
+        || pos + bitmapLength > end || bytes[pos + bitmapLength - 1] === 0) return false;
+    previousWindow = window;
+    pos += bitmapLength;
+  }
+  return pos === end && pos > offset;
+}
+
+// Validate RDATA formats that have well-defined framing. Unknown RR types stay
+// opaque (their formats may be defined by extensions the Worker does not know),
+// but common fixed-size and domain-name-bearing records must not smuggle a
+// malformed name or field sequence into a response that can be relayed/cached.
+function validateKnownRdata(bytes, rr) {
+  const { type, rdataOffset: start, rdEnd: end } = rr;
+  const length = end - start;
+  switch (type) {
+    case 1: return length === 4; // A
+    case 28: case 29: return length === 16; // AAAA, LOC
+    case 108: return length === 6; // EUI48
+    case 109: return length === 8; // EUI64
+
+    // RFC 1035 name-only RRs permit compression. NSAP-PTR is a later type
+    // without a compression exception, so its target must remain uncompressed.
+    case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12:
+      return rdataOneName(bytes, start, end);
+    case 23: case 39: // NSAP-PTR; DNAME target names must not be compressed.
+      return rdataOneName(bytes, start, end, start, false);
+
+    // Legacy MINFO/RP records permit compressed names. TALINK was defined
+    // later and has no compression exception.
+    case 14: case 17:
+      return rdataTwoNames(bytes, start, end);
+    case 58:
+      return rdataTwoNames(bytes, start, end, start, false);
+
+    // Preference field followed by a compression-permitted domain name.
+    case 15: case 18: case 21:
+      return length >= 3 && rdataOneName(bytes, start, end, start + 2);
+    // KX and LP targets must not be compressed.
+    case 36: case 107:
+      return length >= 3 && rdataOneName(bytes, start, end, start + 2, false);
+
+    case 26: // PX: preference, MAP822 name, MAPX400 name
+      return length >= 4 && rdataTwoNames(bytes, start, end, start + 2);
+
+    case 33: // SRV: priority, weight, port, uncompressed target
+      return length >= 7 && rdataOneName(bytes, start, end, start + 6, false);
+
+    case 35: { // NAPTR: order, preference, three character strings, replacement
+      if (length < 8) return false;
+      let pos = start + 4;
+      for (let i = 0; i < 3; i++) {
+        pos = rdataCharStringEnd(bytes, pos, end);
+        if (pos < 0) return false;
+      }
+      return rdataOneName(bytes, start, end, pos, false);
+    }
+
+    case 13: { // HINFO has exactly two character strings.
+      if (length < 2) return false;
+      const first = rdataCharStringEnd(bytes, start, end);
+      if (first < 0) return false;
+      return rdataCharStringEnd(bytes, first, end) === end;
+    }
+    case 16: case 99: { // TXT/SPF is one or more length-prefixed character strings.
+      if (length < 1) return false;
+      let pos = start;
+      while (pos < end) {
+        pos = rdataCharStringEnd(bytes, pos, end);
+        if (pos < 0) return false;
+      }
+      return pos === end;
+    }
+
+    case 24: { // SIG: tolerate historical compression for receiver compatibility.
+      if (length < 20) return false;
+      const signerEnd = rdataNameEndAt(bytes, start + 18, end);
+      return signerEnd >= 0 && signerEnd < end;
+    }
+    case 46: { // RRSIG: signer name must not be compressed.
+      if (length < 20) return false;
+      const signerEnd = rdataNameEndAt(bytes, start + 18, end, false);
+      return signerEnd >= 0 && signerEnd < end;
+    }
+    case 30: { // NXT: next name and legacy bitmap; tolerate historical compression.
+      const nextName = rdataNameEndAt(bytes, start, end);
+      return nextName >= 0 && nextName < end;
+    }
+    case 47: { // NSEC: uncompressed next name followed by type bitmaps.
+      const nextName = rdataNameEndAt(bytes, start, end, false);
+      return nextName >= 0 && validRdataTypeBitmap(bytes, nextName, end);
+    }
+
+    case 43: case 59: // DS/CDS: key tag, algorithm, digest type, digest
+      return length >= 5;
+    case 44: // SSHFP: algorithm, fingerprint type, fingerprint
+      return length >= 3;
+    case 48: case 60: // DNSKEY/CDNSKEY: flags, protocol, algorithm, public key
+    case 49: // DHCID: identifier type, digest type, digest
+    case 52: case 53: // TLSA/SMIMEA: usage, selector, matching type, association data
+      return length >= 4;
+    case 45: { // IPSECKEY: validate the defined gateway field framing.
+      if (length < 3) return false;
+      const gatewayType = bytes[start + 1];
+      const gatewayStart = start + 3;
+      if (gatewayType === 0) return true;
+      if (gatewayType === 1) return gatewayStart + 4 <= end;
+      if (gatewayType === 2) return gatewayStart + 16 <= end;
+      if (gatewayType === 3) return rdataNameEndAt(bytes, gatewayStart, end, false) >= 0;
+      // Leave unrecognized gateway types opaque for future extensions.
+      return true;
+    }
+
+    case 257: { // CAA: flags, non-empty ASCII alphanumeric tag, value
+      if (length < 2) return false;
+      const tagLength = bytes[start + 1];
+      const tagEnd = start + 2 + tagLength;
+      if (tagLength === 0 || tagEnd > end) return false;
+      for (let pos = start + 2; pos < tagEnd; pos++) {
+        const ch = bytes[pos];
+        if (!((ch >= 0x30 && ch <= 0x39) || (ch >= 0x41 && ch <= 0x5a)
+            || (ch >= 0x61 && ch <= 0x7a))) return false;
+      }
+      return true;
+    }
+
+    case 64: case 65: { // SVCB/HTTPS: priority, uncompressed target, sorted SvcParams
+      if (length < 3) return false;
+      const targetEnd = rdataNameEndAt(bytes, start + 2, end, false);
+      if (targetEnd < 0) return false;
+      let pos = targetEnd;
+      let previousKey = -1;
+      const keys = new Set();
+      let mandatoryKeys = null;
+      let hasNoDefaultAlpn = false;
+      let hasAlpn = false;
+      while (pos < end) {
+        if (pos + 4 > end) return false;
+        const key = (bytes[pos] << 8) | bytes[pos + 1];
+        const valueLength = (bytes[pos + 2] << 8) | bytes[pos + 3];
+        pos += 4;
+        const valueStart = pos;
+        const valueEnd = pos + valueLength;
+        if (key <= previousKey || key === 65535 || valueEnd > end) return false;
+        previousKey = key;
+        keys.add(key);
+
+        switch (key) {
+          case 0: { // mandatory: sorted list of keys, excluding key 0 itself
+            if (valueLength < 2 || valueLength % 2 !== 0) return false;
+            mandatoryKeys = [];
+            let lastMandatory = -1;
+            for (let item = valueStart; item < valueEnd; item += 2) {
+              const mandatoryKey = (bytes[item] << 8) | bytes[item + 1];
+              if (mandatoryKey === 0 || mandatoryKey <= lastMandatory) return false;
+              lastMandatory = mandatoryKey;
+              mandatoryKeys.push(mandatoryKey);
+            }
+            break;
+          }
+          case 1: { // alpn: one or more non-empty length-prefixed IDs
+            if (valueLength < 2) return false;
+            let item = valueStart;
+            while (item < valueEnd) {
+              const itemLength = bytes[item++];
+              if (itemLength === 0 || item + itemLength > valueEnd) return false;
+              item += itemLength;
+            }
+            if (item !== valueEnd) return false;
+            hasAlpn = true;
+            break;
+          }
+          case 2: // no-default-alpn is an empty flag and requires alpn.
+            if (valueLength !== 0) return false;
+            hasNoDefaultAlpn = true;
+            break;
+          case 3: // port is exactly one unsigned 16-bit value.
+            if (valueLength !== 2) return false;
+            break;
+          case 4: // ipv4hint contains one or more IPv4 addresses.
+            if (valueLength === 0 || valueLength % 4 !== 0) return false;
+            break;
+          case 6: // ipv6hint contains one or more IPv6 addresses.
+            if (valueLength === 0 || valueLength % 16 !== 0) return false;
+            break;
+          case 8: // ohttp is an empty flag.
+            if (valueLength !== 0) return false;
+            break;
+          default:
+            // Unknown SvcParamKeys are preserved as opaque values.
+            break;
+        }
+        pos = valueEnd;
+      }
+      if (pos !== end || (hasNoDefaultAlpn && !hasAlpn)) return false;
+      if (mandatoryKeys && mandatoryKeys.some((key) => !keys.has(key))) return false;
+      return true;
+    }
+    default:
+      return true;
+  }
+}
 function readUint32(bytes, offset) {
   return (((bytes[offset] * 0x100 + bytes[offset + 1]) * 0x100 + bytes[offset + 2]) * 0x100 + bytes[offset + 3]) >>> 0;
 }
@@ -972,12 +1210,12 @@ function restoreQuestionCase(target, query) {
 function patchDNSResponseForAge(responseBuffer, queryID, ageSeconds, queryBytes, metadata) {
   const source = responseBuffer instanceof Uint8Array ? responseBuffer : new Uint8Array(responseBuffer);
   const copy = source.slice();
-  if (copy.length < 12) return copy.buffer;
   copy[0] = (queryID >> 8) & 0xff;
   copy[1] = queryID & 0xff;
   if (queryBytes) restoreQuestionCase(copy, queryBytes);
+  const age = Math.max(0, ageSeconds);
   for (const record of metadata.records) {
-    writeUint32(copy, record.offset, Math.max(0, record.ttl - Math.max(0, ageSeconds)));
+    writeUint32(copy, record.offset, Math.max(0, record.ttl - age));
   }
   // Only RR TTLs change. SOA MINIMUM is signed RDATA and must stay intact.
   return copy.buffer;
@@ -991,13 +1229,11 @@ async function getEdgeCache(key, origin, queryBytes, questionEnd, ctx) {
     const cacheKey = makeEdgeCacheRequest(origin, key);
     const hit = await cache.match(cacheKey);
     if (!hit) return null;
-    const storedHeader = hit.headers.get('x-doh-stored-at');
-    const ttlHeader = hit.headers.get('x-doh-ttl');
-    const storedAt = Number(storedHeader);
-    const ttlSeconds = Number(ttlHeader);
+    const storedAt = Number(hit.headers.get('x-doh-stored-at'));
+    const ttlSeconds = Number(hit.headers.get('x-doh-ttl'));
     // Bookkeeping headers are checked before the body is read, so an entry
     // that is about to be purged never costs a body read.
-    if (!storedHeader || !ttlHeader || !Number.isFinite(storedAt) || storedAt > Date.now() + 5000
+    if (!Number.isFinite(storedAt) || storedAt > Date.now() + 5000
         || !Number.isInteger(ttlSeconds) || ttlSeconds <= 0 || ttlSeconds > CONFIG.EDGE_CACHE_MAX_TTL_SECONDS) {
       discardBody(hit);
       runInBackground(ctx, purgeEdgeCache(cache, cacheKey));
@@ -1049,8 +1285,7 @@ async function putEdgeCache(key, body, ttlSeconds, storedAt, origin) {
       }
     });
     await cache.put(cacheKey, response);
-  } catch (_) {
-  }
+  } catch (_) {}
 }
 function maybeSweepState() {
   const now = Date.now();
@@ -1224,9 +1459,6 @@ function httpError(message, status) {
 }
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
-}
-function sanitizeHeaderValue(value) {
-  return String(value).replace(/[\r\n]/g, '').slice(0, 200);
 }
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, (ch) => ({

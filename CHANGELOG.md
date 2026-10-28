@@ -5,68 +5,56 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Documentation
-- README: added the missing request-size detail that a GET `dns` parameter
-  longer than 5,462 characters is rejected before decoding; documented the
-  fallback limiter's 256-entry penalty map; noted the 128-key bound on the
-  in-flight coalescing table in the cache section; and mentioned that the
-  dashboard template is built once and cached at module scope (a small CPU
-  optimization for repeat visits to `/`).
-
-### Verified
-- Re-audit found no dead code, no redundant code, no conflicting logic, and
-  no remaining defects. Every CONFIG key is used, every exported helper is
-  referenced by tests, and all documentation matches implementation.
-
-## [0.5.3] - 2026-10-17
-
 ### Fixed
-- The in-flight join timeout (2.5 s) was shorter than the worst-case duration
-  of the resolution a joiner waits for: three sequential upstream timeouts
-  take 3 x 1200 ms = 3.6 s. When every upstream was degraded, each waiting
-  request gave up at 2.5 s and started its own full three-upstream resolution,
-  duplicating upstream traffic exactly when the upstreams were least able to
-  absorb it. The join timeout is now 4 s, above that worst case. The comment
-  that claimed a worst case of "~220 + 150 + 1200 ms" (the hedging path only)
-  is corrected.
+- Upstream DNS response validation checks that EDNS OPT option headers and
+  payloads exactly fill the OPT RDATA, so malformed options trigger resolver
+  failover and cannot enter either cache.
+- DNS compression-pointer targets must have their entire encoded name before
+  the referring pointer. Previously, a target could start before the pointer
+  but consume its bytes or later bytes, allowing a malformed response to pass.
+- Malformed SOA RDATA is rejected instead of being accepted in a positive
+  response when it cannot safely be interpreted for cache-TTL handling.
+- Questionless response validation now checks the final RCODE after EDNS OPT
+  contributes its extended RCODE bits, so a valid questionless BADVERS response
+  is not misclassified as NOERROR.
+- Upstream response validation checks common typed RDATA framing, including
+  A/AAAA lengths, name-bearing RDATA, TXT/SPF/HINFO strings, protocol-specific
+  name-compression rules (including uncompressed DNAME, KX, TALINK, LP,
+  NSAP-PTR and IPSECKEY names), and legacy SIG/NXT/PX compression compatibility.
+- CAA tags must contain only ASCII letters and digits. SVCB/HTTPS validation
+  checks selected defined SvcParam layouts and mandatory-key consistency while
+  preserving unknown parameter keys as opaque values.
 
-### Tests
-- 113 tests (1 new): a joiner whose leader is still inside the
-  three-sequential-timeout window attaches to it instead of forking a
-  duplicate resolution. The new test fails against 0.5.2.
-
-## [0.5.2] - 2026-10-15
-
-### Fixed
-- A query whose EDNS OPT record carried a malformed option list (an option
-  length running past the end of the RDATA, or a dangling partial option
-  header) passed `parseDNSQuestion()`, and then made `cacheKeyBytes()` throw.
-  Nothing caught it, so `fetch()` threw and Cloudflare answered with an error
-  page (HTTP 500, Worker exception) instead of `400`. The option framing is now
-  validated with the rest of the OPT record and such a query is rejected with
-  `400 Malformed EDNS options` before any cache or upstream work. A fuzz run
-  over 300,000 mutated queries and 20,000 full `fetch()` round trips no longer
-  produces an exception.
+### Performance
+- Shared the RDATA framing helpers across records instead of allocating several
+  closures for every resource record.
 
 ### Changed
-- The `+`/`-` score update shared by `reward()`, `noteOvertaken()` and
-  `penalize()` (clamp to `SCORE_MIN`..`SCORE_MAX`, restart the recovery clock)
-  lives in one `adjustScore()` helper instead of three copies. Behaviour is
-  unchanged.
-- `validateDNSMessage()` no longer declares a second, shadowing `ttl` variable
-  inside its record loop (renamed `recordTtl`), and the capped SOA `MINIMUM`
-  is computed once instead of twice. Behaviour is unchanged.
-- The `joiners` field of an in-flight entry is documented as test-harness
-  bookkeeping: production code increments it but never reads it.
-- The comment on `cacheKeyBytes()` no longer claims that `parseDNSQuestion()`
-  validated OPT options before it actually did.
-- Package and `/health` version bumped to 0.5.2.
+- Removed redundant code: the constant-only `sanitizeHeaderValue()` on the
+  `x-winner` header, the single-use `validateMethod()` wrapper, an unreachable
+  short-message guard in `patchDNSResponseForAge()`, and header presence checks
+  in the L2 reader that the numeric checks already covered (an entry with a
+  missing `x-doh-stored-at` or `x-doh-ttl` is still purged before its body is
+  read). Identical RDATA validator cases (AAAA/LOC, NSAP-PTR/DNAME,
+  DNSKEY/DHCID/TLSA-family) were merged. Behaviour is unchanged.
+- The in-flight join-timeout comment now describes 3 x upstream timeout as a
+  conservative bound, since hedged attempts overlap.
+
+### Documentation
+- README test count corrected (121 -> 123) and the dashboard-template caching
+  description now matches the code (built lazily on first request, then cached).
+- README reflects the 123-test suite, documents typed RDATA checks and the
+  remaining compression-target boundary limitation, and keeps the current official
+  Workers limits documentation linked directly.
 
 ### Tests
-- 112 tests (4 new). Covers OPT option framing (exact fit, two options, overrun,
-  partial header, trailing partial option), a guarantee that every query
-  accepted by the parser has computable cache-key bytes, `400` instead of an
-  exception for GET and POST with malformed options, and resolver scores
-  staying within `SCORE_MIN`..`SCORE_MAX`. The first and third of these fail
-  against 0.5.1.
+- 123 tests (10 added since 0.5.3): malformed upstream OPT option lengths,
+  partial option headers and trailing partial headers are rejected; malformed
+  responses trigger failover and are not cached; questionless extended-RCODE
+  errors are checked correctly; compression targets that overlap their source
+  pointer, malformed SOA RDATA and malformed common RDATA layouts are rejected;
+  valid compressed CNAME/MX and legacy SIG/PX/NXT RDATA remain accepted;
+  prohibited NSAP-PTR/DNAME/KX/TALINK/LP/IPSECKEY compression, invalid CAA
+  tags and malformed selected SvcParams are rejected; valid uncompressed SIG,
+  SPF and SVCB RDATA are accepted.
 

@@ -1,6 +1,6 @@
 # 🛡️ DoH — Cloudflare Worker
 
-A lightweight Cloudflare Worker that exposes a standard **DNS-over-HTTPS** endpoint, uses three HaGeZi resolvers with intelligent staged failover, and keeps a two-level DNS cache (Worker version 0.5.7; 134-test suite):
+A lightweight Cloudflare Worker that exposes a standard **DNS-over-HTTPS** endpoint, uses three HaGeZi resolvers with intelligent staged failover, and keeps a two-level DNS cache (Worker version 0.5.8; 136-test suite):
 
 ```txt
 L1: per-isolate memory cache
@@ -49,7 +49,7 @@ The Cache API is data-center-local and does not replicate entries automatically 
 
 Both DoH GET and POST requests use the same cache key: the DNS wire query with the transaction ID set to 0, the question name lower-cased, and every EDNS Padding option (RFC 7830) replaced by an empty one. Padding length never splits the cache, but whether the client asked for padding does, because padded responses are meant only for padding clients. Flags, the question type/class and every other EDNS option remain part of the key. L1 and the in-flight table use these key bytes directly (no hashing on the hot path); the L2 Cache API URL uses the first 128 bits of their SHA-256, computed only after an L1 miss, hex-encoded through a precomputed nibble table so key computation allocates no per-byte strings. EDNS Cookies deliberately stay in the key: a response echoes the client's cookie, so sharing it with another client would be wrong. ASCII QNAME case is normalized (question names are always uncompressed here, because queries with a compressed question name are rejected before the cache key is computed), so `example.com`, `EXAMPLE.com`, and mixed-case variants can share a cache entry. Therefore the same DNS question can share a cache entry across GET and POST. Every response, including a fresh answer and a coalesced one, is built from a copy of the shared answer with the requesting client's transaction ID and, when the response echoes a question, that question's exact letter case, so DNS 0x20-style case randomization still validates and the cached copy is never modified.
 
-Only DNS answers that are safe to reuse are cached: `NOERROR` and `NXDOMAIN` responses that are not truncated (TC) and are at most 65,535 bytes. Negative answers (`NXDOMAIN`/`NODATA`) are cached only when they carry an SOA record. Any response with an authority-section SOA, including a `NOERROR` CNAME chain that ends in NODATA, is capped by the SOA `MINIMUM` field, per RFC 2308. Record TTLs with the top bit set are treated as 0 (RFC 2181), so such answers are not cached; the SOA `MINIMUM` field gets the same treatment. The cache TTL is the minimum across all non-OPT records in the answer, authority and additional sections, so a short-lived record in any section cannot be over-cached. `SERVFAIL`, `REFUSED` and similar responses are relayed to the client (marked `x-dns-degraded: 1`) but never cached.
+Only DNS answers that are safe to reuse are cached: `NOERROR` and `NXDOMAIN` responses that are not truncated (TC) and are at most 65,535 bytes. Negative answers (`NXDOMAIN`/`NODATA`) are cached only when they carry an SOA record. CNAME/DNAME records in alias-only answers are positive data and remain cacheable using their DNS TTL; an alias-only response does not by itself establish that the target lacks the requested RR type. Any response with an authority-section SOA, including a `NOERROR` CNAME chain that ends in NODATA, is capped by the SOA `MINIMUM` field, per RFC 2308. Record TTLs with the top bit set are treated as 0 (RFC 2181), so such answers are not cached; the SOA `MINIMUM` field gets the same treatment. The cache TTL is the minimum across all non-OPT records in the answer, authority and additional sections, so a short-lived record in any section cannot be over-cached. `SERVFAIL`, `REFUSED` and similar responses are relayed to the client (marked `x-dns-degraded: 1`) but never cached.
 
 Responses cached internally use DNS TTL-derived expiration. The response transaction ID is rewritten for each client, and cached DNS record TTLs are reduced by cache age before being returned; for an authority-section SOA, the Worker serves `min(SOA TTL, SOA MINIMUM) - age` as the SOA record TTL. It never modifies SOA `MINIMUM` or other RDATA, because RRSIG signatures cover RDATA and changing it would break DNSSEC validation. An L2 hit is not written back: the entry simply expires at its original time and is then re-resolved (a hit is promoted to L1 with its remaining TTL). `Cache-Control: no-store` remains on the client-facing response so the Worker controls the DNS cache instead of creating an uncontrolled browser/HTTP cache layer.
 
@@ -132,7 +132,7 @@ Run the included Node.js unit tests from the project folder. Use Node.js 22 or n
 npm test        # or: node --test
 ```
 
-The suite (134 tests) mocks `fetch` and the Cache API, so it needs no network or Cloudflare account. Test-only hooks live in `worker-harness.mjs`, which appends them to a temporary copy of `Worker.js` and deletes that copy once it is imported; the deployed Worker exports only its default fetch handler. Coalescing tests wait on the harness's joiner counter instead of fixed sleeps. CI also runs `node --check Worker.js` and `npm run check` (`wrangler deploy --dry-run` with Wrangler pinned to 4.151.0) to validate the bundle and `wrangler.toml` without deploying.
+The suite (136 tests) mocks `fetch` and the Cache API, so it needs no network or Cloudflare account. Test-only hooks live in `worker-harness.mjs`, which appends them to a temporary copy of `Worker.js` and deletes that copy once it is imported; the deployed Worker exports only its default fetch handler. Coalescing tests wait on the harness's joiner counter instead of fixed sleeps. CI also runs `node --check Worker.js` and `npm run check` (`wrangler deploy --dry-run` with Wrangler pinned to 4.151.0) to validate the bundle and `wrangler.toml` without deploying.
 
 ### Verifying a deployment
 
@@ -157,11 +157,11 @@ x-cache: L1-HIT / L2-HIT / COALESCED / MISS
 x-edge-cache: HIT / MISS / SKIP / DISABLED   (DISABLED only if EDGE_CACHE_ENABLED is set to false in CONFIG)
 x-upstreams: 0 / 1 / 2 / 3
 x-winner: <HaGeZi-upstream-url>      (MISS, and COALESCED when the shared request went upstream)
-x-winner-lat: <latency>               (MISS, and COALESCED when the shared request went upstream)
+x-winner-lat: <latency>ms             (MISS, and COALESCED when the shared request went upstream)
 x-dns-degraded: 1   (only when no resolver gave a usable answer: SERVFAIL/REFUSED/etc., or a truncated NOERROR/NXDOMAIN fallback)
 ```
 
-The `/health` endpoint reports the Worker version, the three resolver scores, and L1/L2 cache, in-flight and rate-limit state for the isolate that served it.
+The `/health` endpoint reports the Worker version, the three resolver scores, the L1 cache entry and byte counts, whether L2 is enabled, the in-flight and throttle counts, and the rate-limit settings, for the isolate that served it. It does not report L2 hit counters, which the Cache API does not expose to the Worker.
 
 ## Important limitation
 

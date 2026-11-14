@@ -1,4 +1,4 @@
-const VERSION = '0.5.7';
+const VERSION = '0.5.8';
 const CONFIG = {
   DNS_PATH: '/dns-query',
   EDGE_CACHE_ENABLED: true,
@@ -401,7 +401,10 @@ function parseDNSQuestion(bytes) {
       if (!optionsWellFormed(bytes, rr.rdataOffset, rr.rdEnd)) {
         return { ok: false, error: 'Malformed EDNS options' };
       }
-    } else if (!validateKnownRdata(bytes, rr, nameBoundaries)) {
+    } else if (
+      !validateKnownRdata(bytes, rr, nameBoundaries)
+      || (rr.type === 6 && findSOAMinimumOffset(bytes, rr.rdataOffset, rr.rdEnd, nameBoundaries) < 0)
+    ) {
       return { ok: false, error: 'Malformed DNS additional record RDATA' };
     }
     offset = rr.rdEnd;
@@ -457,6 +460,9 @@ async function resolveWithHedging(nodes, packet, expectedID, questionEnd) {
   const controllers = new Map();
   const active = new Map();
   const startedAt = new Map();
+  // Attempts whose relay has already settled. Only attempts still running when
+  // a winner is chosen count as overtaken.
+  const settled = new Set();
   let attempts = 0;
   let nextIndex = 0;
   let fallback = null;
@@ -466,8 +472,8 @@ async function resolveWithHedging(nodes, packet, expectedID, questionEnd) {
     controllers.set(node, controller);
     startedAt.set(node, Date.now());
     const promise = relay(node, packet, encodedQuery, expectedID, controller.signal, questionEnd)
-      .then((value) => ({ ok: true, node, value }))
-      .catch((error) => ({ ok: false, node, error }));
+      .then((value) => { settled.add(node); return { ok: true, node, value }; })
+      .catch((error) => { settled.add(node); return { ok: false, node, error }; });
     active.set(node, promise);
     attempts += 1;
   };
@@ -497,7 +503,7 @@ async function resolveWithHedging(nodes, packet, expectedID, questionEnd) {
           const winnerStart = startedAt.get(result.node);
           for (const loser of active.keys()) {
             const loserStart = startedAt.get(loser);
-            if (loserStart < winnerStart) noteOvertaken(loser, now - loserStart);
+            if (!settled.has(loser) && loserStart < winnerStart) noteOvertaken(loser, now - loserStart);
           }
           return {
             ...value,
@@ -692,9 +698,10 @@ function validateDNSMessage(responseBuffer, { expectedID = null, queryBytes = nu
   let optCount = 0;
   let soaMin = Infinity;
   let recordMin = Infinity;
-  const counts = [ancount, nscount, arcount];
-  for (let section = 0; section < counts.length; section++) {
-    for (let i = 0; i < counts[section]; i++) {
+  for (let section = 0; section < 3; section++) {
+    // Avoid allocating a section-count array on every validated response.
+    const count = section === 0 ? ancount : section === 1 ? nscount : arcount;
+    for (let i = 0; i < count; i++) {
       const rr = readResourceRecord(bytes, offset, nameBoundaries);
       if (!rr) return { ok: false, error: 'Truncated DNS resource record' };
       if (rr.type === 41) {
@@ -920,10 +927,7 @@ function skipDNSName(bytes, offset, allowPointer, nameBoundaries) {
   while (pos < bytes.length) {
     const len = bytes[pos];
     if (len === 0) {
-      if (nameBoundaries) {
-        for (const start of labelStarts) nameBoundaries.add(start);
-        nameBoundaries.add(pos);
-      }
+      if (nameBoundaries) commitNameBoundaries(nameBoundaries, labelStarts, pos);
       return pos + 1;
     }
     if ((len & 0xc0) === 0xc0) {
@@ -933,10 +937,7 @@ function skipDNSName(bytes, offset, allowPointer, nameBoundaries) {
       // label's payload could otherwise be mistaken for a valid root/label.
       if (nameBoundaries && !nameBoundaries.has(target)) return -1;
       if (!isValidNamePointerTarget(bytes, target, pos, wireLength)) return -1;
-      if (nameBoundaries) {
-        for (const start of labelStarts) nameBoundaries.add(start);
-        nameBoundaries.add(pos);
-      }
+      if (nameBoundaries) commitNameBoundaries(nameBoundaries, labelStarts, pos);
       return pos + 2;
     }
     if ((len & 0xc0) !== 0 || pos + 1 + len > bytes.length) return -1;
@@ -946,6 +947,12 @@ function skipDNSName(bytes, offset, allowPointer, nameBoundaries) {
     pos += 1 + len;
   }
   return -1;
+}
+// Records every label start of the name just walked, plus the name's terminal
+// position (root byte or pointer), as valid compression targets.
+function commitNameBoundaries(nameBoundaries, labelStarts, end) {
+  for (const start of labelStarts) nameBoundaries.add(start);
+  nameBoundaries.add(end);
 }
 // A compression pointer must point backwards into the message body (never
 // into the header, itself or forward, which also rules out loops) at a
@@ -1427,11 +1434,10 @@ function localRateLimit(ip) {
   stats.count += 1;
   APP_STATE.throttle.delete(ip);
   APP_STATE.throttle.set(ip, stats);
-  trimThrottleMap();
+  trimThrottleMap(now);
   return stats.count <= CONFIG.RATE_LIMIT_MAX_REQUESTS;
 }
-function trimThrottleMap() {
-  const now = Date.now();
+function trimThrottleMap(now) {
   while (APP_STATE.throttle.size > CONFIG.MAX_THROTTLE_ENTRIES) {
     const oldestKey = APP_STATE.throttle.keys().next().value;
     const stats = APP_STATE.throttle.get(oldestKey);
@@ -1452,7 +1458,7 @@ function trimMap(map, maxEntries) {
   }
 }
 function rateLimitKey(ip) {
-  if (!ip.includes(':') || ip.endsWith('/64')) return ip;
+  if (!ip.includes(':')) return ip;
   const halves = ip.toLowerCase().split('::');
   if (halves.length > 2 || ip.includes('.')) return ip; // trusted CF header; mapped IPv4 unchanged
   const left = halves[0] ? halves[0].split(':') : [];
@@ -1774,6 +1780,7 @@ function buildUITemplate() {
         const FIELDS = { main: 'mainTitle', sub: 'subTag', urlL: 'labelUrl', cpT: 'txtCopy', tabC: 'btnC', tabF: 'btnF', tabM: 'btnM',
             cH: 'cH', cL: 'cL', fH: 'fH', fL: 'fL', mH: 'mH', mD: 'mD', mL: 'mL', whyH: 'whyH', whyT: 'whyT' };
         for (const [key, id] of Object.entries(FIELDS)) I18N.en[key] = document.getElementById(id).innerHTML;
+        let currentLang = 'en';
         function getStoredLanguage() {
             let stored = 'en';
             try { stored = localStorage.getItem('doc_v6') || 'en'; } catch (_) {}
@@ -1781,6 +1788,7 @@ function buildUITemplate() {
         }
         function changeLang(c) {
             if (!Object.prototype.hasOwnProperty.call(I18N, c)) c = 'en';
+            currentLang = c;
             try { localStorage.setItem('doc_v6', c); } catch (_) {}
             const l = I18N[c];
             document.body.classList.toggle('lang-fa', c === 'fa');
@@ -1799,7 +1807,7 @@ function buildUITemplate() {
         async function copyURL() {
             const el = document.getElementById('linkInp');
             const status = document.getElementById('copyStatus');
-            const l = I18N[getStoredLanguage()];
+            const l = I18N[currentLang];
             try {
                 await navigator.clipboard.writeText(el.value);
                 status.textContent = l.copied;

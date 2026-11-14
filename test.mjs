@@ -103,6 +103,20 @@ test('parseDNSQuestion accepts a standard A query', () => {
   const parsed = __internals.parseDNSQuestion(makeQuery('example.com'));
   assert.deepEqual(parsed, { ok: true, id: 0x1234, questionEnd: 25 });
 });
+test('parseDNSQuestion validates SOA RDATA in additional records', () => {
+  const malformed = Array.from(makeQuery('soa-additional.example'));
+  malformed[11] = 1;
+  malformed.push(0xc0, 0x0c, 0, 6, 0, 1, ...u32(60), 0, 1, 0);
+  const rejected = __internals.parseDNSQuestion(Uint8Array.from(malformed));
+  assert.equal(rejected.ok, false);
+  assert.match(rejected.error, /additional record RDATA/i);
+
+  const valid = Array.from(makeQuery('soa-additional.example'));
+  valid[11] = 1;
+  const soa = [0, 0, ...u32(1), ...u32(2), ...u32(3), ...u32(4), ...u32(5)];
+  valid.push(0xc0, 0x0c, 0, 6, 0, 1, ...u32(60), 0, soa.length, ...soa);
+  assert.equal(__internals.parseDNSQuestion(Uint8Array.from(valid)).ok, true);
+});
 test('parseDNSQuestion rejects additional-record pointers into label payload bytes', () => {
   const query = [
     0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 1,
@@ -714,10 +728,7 @@ test('hedging: first resolver fails, second answers, third is never contacted', 
     fetch: async (url, init) => {
       calls.push(url);
       if (calls.length === 1) throw new Error('boom');
-      return new Response(makeAResponse(init.body, 60), {
-        status: 200,
-        headers: { 'content-type': 'application/dns-message' }
-      });
+      return okResponse(init);
     },
     caches: cacheMock()
   });
@@ -745,17 +756,14 @@ test('hedging: the slower attempt is aborted and not counted as a failure or tim
       .upstreams.reduce((sum, u) => sum + u.timeout + u.fail, 0);
     assert.equal(after, before);
   }, {
-    fetch: (url, init) => {
+    fetch: (_url, init) => {
       signals.push(init.signal);
       if (signals.length === 1) {
         return new Promise((_resolve, reject) => {
           init.signal.addEventListener('abort', () => reject(new Error('aborted')));
         });
       }
-      return Promise.resolve(new Response(makeAResponse(init.body, 60), {
-        status: 200,
-        headers: { 'content-type': 'application/dns-message' }
-      }));
+      return Promise.resolve(okResponse(init));
     },
     caches: cacheMock()
   });
@@ -785,10 +793,7 @@ test('concurrent cold-cache misses coalesce into a single upstream job', async (
     fetch: async (_url, init) => {
       calls += 1;
       await gate;
-      return new Response(makeAResponse(init.body, 60), {
-        status: 200,
-        headers: { 'content-type': 'application/dns-message' }
-      });
+      return okResponse(init);
     },
     caches: cacheMock()
   });
@@ -840,9 +845,7 @@ test('oversized L2 cache bodies are capped while streaming and re-resolved', asy
   }, {
     fetch: async (_url, init) => {
       upstreamCalls += 1;
-      return new Response(makeAResponse(init.body, 60), {
-        headers: { 'content-type': 'application/dns-message' }
-      });
+      return okResponse(init);
     },
     caches: {
       default: {
@@ -868,9 +871,7 @@ test('L2 entries whose response body cannot be read are purged and re-resolved',
   }, {
     fetch: async (_url, init) => {
       upstreamCalls += 1;
-      return new Response(makeAResponse(init.body, 60), {
-        headers: { 'content-type': 'application/dns-message' }
-      });
+      return okResponse(init);
     },
     caches: {
       default: {
@@ -1062,7 +1063,7 @@ test('upstream queries use RFC 8484 GET with the client query as base64url', asy
   }, {
     fetch: async (url, init) => {
       seen.push({ url, method: init.method, hasBody: init.originalBody != null });
-      return new Response(makeAResponse(init.body, 60), { headers: { 'content-type': 'application/dns-message' } });
+      return okResponse(init);
     },
     caches: cacheMock()
   });
@@ -1097,10 +1098,7 @@ test('L2 entries with a corrupt DNS body are purged and re-resolved upstream', a
   }, {
     fetch: async (_url, init) => {
       upstreamCalls += 1;
-      return new Response(makeAResponse(init.body, 60), {
-        status: 200,
-        headers: { 'content-type': 'application/dns-message' }
-      });
+      return okResponse(init);
     },
     caches: {
       default: {
@@ -1125,10 +1123,7 @@ test('L2 entries echoing a different question are purged and re-resolved', async
     assert.equal(res.headers.get('x-cache'), 'MISS');
     assert.equal(purged, true);
   }, {
-    fetch: async (_url, init) => new Response(makeAResponse(init.body, 60), {
-      status: 200,
-      headers: { 'content-type': 'application/dns-message' }
-    }),
+    fetch: async (_url, init) => okResponse(init),
     caches: {
       default: {
         match: async (req) => (req.url.endsWith(key)
@@ -1258,10 +1253,7 @@ test('a throwing ctx.waitUntil does not break a cache miss', async () => {
     assert.equal(res.status, 200);
     assert.equal(res.headers.get('x-cache'), 'MISS');
   }, {
-    fetch: async (_url, init) => new Response(makeAResponse(init.body, 60), {
-      status: 200,
-      headers: { 'content-type': 'application/dns-message' }
-    }),
+    fetch: async (_url, init) => okResponse(init),
     caches: cacheMock()
   });
 });
@@ -1489,6 +1481,15 @@ test('malformed error responses are rejected, well-formed ones stay accepted', (
 });
 
 // ---- 0.4.0 regressions and previously uncovered paths ----
+function makeAliasOnlyResponse(query, type, ttl = 60) {
+  const bytes = Array.from(query);
+  bytes[2] = 0x81; bytes[3] = 0x80;
+  bytes[6] = 0; bytes[7] = 1;
+  bytes[8] = bytes[9] = bytes[10] = bytes[11] = 0;
+  const target = [6, 116, 97, 114, 103, 101, 116, 7, 101, 120, 97, 109, 112, 108, 101, 0];
+  bytes.push(0xc0, 0x0c, (type >> 8) & 0xff, type & 0xff, 0, 1, ...u32(ttl), 0, target.length, ...target);
+  return Uint8Array.from(bytes);
+}
 function makeCnameNodata(query) {
   const b = Array.from(query);
   b[2] = 0x81; b[3] = 0x80; b[7] = 1; b[9] = 1;
@@ -1497,6 +1498,11 @@ function makeCnameNodata(query) {
   b.push(0xc0, 0x0c, 0, 6, 0, 1, ...u32(3600), 0, rd.length, ...rd);
   return Uint8Array.from(b);
 }
+test('alias-only CNAME and DNAME answers remain cacheable as positive data', () => {
+  const query = makeQuery('alias-answer.example');
+  assert.equal(__internals.getDNSCacheTTL(makeAliasOnlyResponse(query, 5)), 60);
+  assert.equal(__internals.getDNSCacheTTL(makeAliasOnlyResponse(query, 39)), 60);
+});
 test('CNAME to NODATA answers respect SOA MINIMUM', () => {
   assert.equal(__internals.getDNSCacheTTL(makeCnameNodata(makeQuery('cname-nodata.example'))), 60);
 });

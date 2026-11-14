@@ -308,7 +308,7 @@ async function readCappedBody(source, maxBytes, tooLargeMessage) {
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
-      if (!value || value.byteLength === 0) continue;
+      if (value.byteLength === 0) continue;
       total += value.byteLength;
       if (total > maxBytes) {
         try { await reader.cancel('message-too-large'); } catch (_) {}
@@ -356,7 +356,7 @@ function encodeBase64Url(bytes) {
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 function parseDNSQuestion(packet) {
-  const bytes = packet instanceof Uint8Array ? packet : new Uint8Array(packet);
+  const bytes = packet;
   if (bytes.byteLength < 12) {
     return { ok: false, error: 'DNS message too short' };
   }
@@ -453,7 +453,6 @@ function selectRacers(resolvers) {
 }
 const HEDGE_TIMER = Symbol('hedge-timer');
 async function resolveWithHedging(nodes, packet, expectedID, questionEnd) {
-  if (!nodes.length) throw new Error('No upstreams configured');
   const encodedQuery = encodeBase64Url(packet);
   const controllers = new Map();
   const active = new Map();
@@ -681,8 +680,6 @@ function validateDNSMessage(responseBuffer, { expectedID = null, queryBytes = nu
     }
     offset += 4;
   }
-  // A questionless response can be accepted only if its final RCODE is an
-  // error; the extended RCODE is not known until OPT has been parsed below.
   if (question && queryBytes) {
     // Callers pass the parsed question end of the original query.
     const match = matchQuestion(bytes, question, queryBytes, questionEnd);
@@ -741,7 +738,7 @@ function validateDNSMessage(responseBuffer, { expectedID = null, queryBytes = nu
       || ((rcode === 3 || ancount === 0) && soaMin === Infinity)
       || !Number.isFinite(ttl)) ttl = 0;
   ttl = Math.max(0, Math.min(ttl, CONFIG.EDGE_CACHE_MAX_TTL_SECONDS));
-  return { ok: true, rcode, truncated, metadata: { ttl, records } };
+  return { ok: true, rcode, truncated, metadata: { ttl, records, hasQuestion: question !== null } };
 }
 
 function lowerAscii(value) { return value >= 65 && value <= 90 ? value + 32 : value; }
@@ -1005,10 +1002,10 @@ function rdataNameEndAt(bytes, offset, end, allowPointer = true, nameBoundaries 
   const next = skipDNSName(bytes, offset, allowPointer, nameBoundaries);
   return next >= 0 && next <= end ? next : -1;
 }
-function rdataOneName(bytes, start, end, offset = start, allowPointer = true, nameBoundaries = null) {
+function rdataOneName(bytes, end, offset, allowPointer = true, nameBoundaries = null) {
   return rdataNameEndAt(bytes, offset, end, allowPointer, nameBoundaries) === end;
 }
-function rdataTwoNames(bytes, start, end, offset = start, allowPointer = true, nameBoundaries = null) {
+function rdataTwoNames(bytes, end, offset, allowPointer = true, nameBoundaries = null) {
   const first = rdataNameEndAt(bytes, offset, end, allowPointer, nameBoundaries);
   if (first < 0) return false;
   return rdataNameEndAt(bytes, first, end, allowPointer, nameBoundaries) === end;
@@ -1049,29 +1046,29 @@ function validateKnownRdata(bytes, rr, nameBoundaries = null) {
     // RFC 1035 name-only RRs permit compression. NSAP-PTR is a later type
     // without a compression exception, so its target must remain uncompressed.
     case 2: case 3: case 4: case 5: case 7: case 8: case 9: case 12:
-      return rdataOneName(bytes, start, end, start, true, nameBoundaries);
+      return rdataOneName(bytes, end, start, true, nameBoundaries);
     case 23: case 39: // NSAP-PTR; DNAME target names must not be compressed.
-      return rdataOneName(bytes, start, end, start, false, nameBoundaries);
+      return rdataOneName(bytes, end, start, false, nameBoundaries);
 
     // Legacy MINFO/RP records permit compressed names. TALINK was defined
     // later and has no compression exception.
     case 14: case 17:
-      return rdataTwoNames(bytes, start, end, start, true, nameBoundaries);
+      return rdataTwoNames(bytes, end, start, true, nameBoundaries);
     case 58:
-      return rdataTwoNames(bytes, start, end, start, false, nameBoundaries);
+      return rdataTwoNames(bytes, end, start, false, nameBoundaries);
 
     // Preference field followed by a compression-permitted domain name.
     case 15: case 18: case 21:
-      return length >= 3 && rdataOneName(bytes, start, end, start + 2, true, nameBoundaries);
+      return length >= 3 && rdataOneName(bytes, end, start + 2, true, nameBoundaries);
     // KX and LP targets must not be compressed.
     case 36: case 107:
-      return length >= 3 && rdataOneName(bytes, start, end, start + 2, false, nameBoundaries);
+      return length >= 3 && rdataOneName(bytes, end, start + 2, false, nameBoundaries);
 
     case 26: // PX: preference, MAP822 name, MAPX400 name
-      return length >= 4 && rdataTwoNames(bytes, start, end, start + 2, true, nameBoundaries);
+      return length >= 4 && rdataTwoNames(bytes, end, start + 2, true, nameBoundaries);
 
     case 33: // SRV: priority, weight, port, uncompressed target
-      return length >= 7 && rdataOneName(bytes, start, end, start + 6, false, nameBoundaries);
+      return length >= 7 && rdataOneName(bytes, end, start + 6, false, nameBoundaries);
 
     case 35: { // NAPTR: order, preference, three character strings, replacement
       if (length < 8) return false;
@@ -1080,7 +1077,7 @@ function validateKnownRdata(bytes, rr, nameBoundaries = null) {
         pos = rdataCharStringEnd(bytes, pos, end);
         if (pos < 0) return false;
       }
-      return rdataOneName(bytes, start, end, pos, false, nameBoundaries);
+      return rdataOneName(bytes, end, pos, false, nameBoundaries);
     }
 
     case 13: { // HINFO has exactly two character strings.
@@ -1188,7 +1185,7 @@ function validateKnownRdata(bytes, rr, nameBoundaries = null) {
         pos += 4;
         const valueStart = pos;
         const valueEnd = pos + valueLength;
-        if (key === 0 || key <= previousKey || key === 65535 || valueEnd > end) return false;
+        if (key <= previousKey || key === 65535 || valueEnd > end) return false;
         previousKey = key;
         keys.add(key);
 
@@ -1275,7 +1272,7 @@ function patchDNSResponseForAge(responseBuffer, queryID, ageSeconds, queryBytes,
   const copy = source.slice();
   copy[0] = (queryID >> 8) & 0xff;
   copy[1] = queryID & 0xff;
-  if (queryBytes) restoreQuestionCase(copy, queryBytes);
+  if (queryBytes && metadata.hasQuestion) restoreQuestionCase(copy, queryBytes);
   const age = Math.max(0, ageSeconds);
   for (const record of metadata.records) {
     writeUint32(copy, record.offset, Math.max(0, record.ttl - age));
@@ -1774,10 +1771,10 @@ function buildUITemplate() {
         function getStoredLanguage() {
             let stored = 'en';
             try { stored = localStorage.getItem('doc_v6') || 'en'; } catch (_) {}
-            return I18N[stored] ? stored : 'en';
+            return Object.prototype.hasOwnProperty.call(I18N, stored) ? stored : 'en';
         }
         function changeLang(c) {
-            if (!I18N[c]) c = 'en';
+            if (!Object.prototype.hasOwnProperty.call(I18N, c)) c = 'en';
             try { localStorage.setItem('doc_v6', c); } catch (_) {}
             const l = I18N[c];
             document.body.classList.toggle('lang-fa', c === 'fa');
@@ -1813,10 +1810,15 @@ function buildUITemplate() {
 </body>
 </html>`;
 }
+// The page differs between requests only in its endpoint, so the last page
+// rendered is kept and reused while the endpoint stays the same.
+let UI_PAGE = { endpoint: null, html: null };
 function renderUI(host) {
   const endpoint = escapeHtml(`https://${host}${CONFIG.DNS_PATH}`);
-  const html = getUITemplate().join(endpoint);
-  return new Response(html, {
+  if (UI_PAGE.endpoint !== endpoint) {
+    UI_PAGE = { endpoint, html: getUITemplate().join(endpoint) };
+  }
+  return new Response(UI_PAGE.html, {
     status: 200,
     headers: {
       'content-type': 'text/html; charset=utf-8',

@@ -242,7 +242,7 @@ test('validateDNSResponse validates CAA tags, SPF strings and defined SVCB param
     makeRecordResponse(query, 257, [0, 1, 1, 0]), // CAA tags must be ASCII alphanumeric.
     makeRecordResponse(query, 65, [0, 1, 0, 0, 3, 0, 1, 80]), // port must be exactly two octets.
     makeRecordResponse(query, 65, [0, 1, 0, 0, 0, 0, 2, 0, 3]), // mandatory key 3 is absent.
-    makeRecordResponse(query, 64, [0, 1, 0, 0, 0, 0, 1, 0]), // SvcParamKey 0 is reserved for mandatory.
+    makeRecordResponse(query, 64, [0, 1, 0, 0, 0, 0, 1, 0]), // mandatory (key 0) needs an even-length key list.
     makeRecordResponse(query, 65, [0, 1, 0, 0, 2, 0, 1, 65]) // no-default-alpn is an empty flag.
   ];
   for (const response of malformed) {
@@ -260,6 +260,15 @@ test('validateDNSResponse validates CAA tags, SPF strings and defined SVCB param
   // ServiceMode-specific value checks (here, a one-byte port parameter).
   const aliasModeWithIgnoredParams = makeRecordResponse(query, 65, [0, 0, 0, 0, 3, 0, 1, 80]);
   assert.equal(__internals.validateDNSResponse(aliasModeWithIgnoredParams, 0x1234, query).ok, true);
+});
+test('validateDNSResponse accepts an SVCB mandatory list whose keys are all present', () => {
+  const query = makeQuery('mandatory.example');
+  // ServiceMode: priority 1, root target, mandatory=[port], port=443.
+  const valid = makeRecordResponse(query, 65, [0, 1, 0, 0, 0, 0, 2, 0, 3, 0, 3, 0, 2, 1, 187]);
+  assert.equal(__internals.validateDNSResponse(valid, 0x1234, query).ok, true);
+  // The same record whose mandatory list names an absent key (5) must fail.
+  const absent = makeRecordResponse(query, 65, [0, 1, 0, 0, 0, 0, 2, 0, 5, 0, 3, 0, 2, 1, 187]);
+  assert.equal(__internals.validateDNSResponse(absent, 0x1234, query).ok, false);
 });
 test('malformed upstream A RDATA triggers failover and is never cached', async () => {
   let calls = 0;
@@ -654,8 +663,7 @@ test('hedge delays stay inside their configured bounds', () => {
   assert.equal(getHedgeDelay({ ewmaLatencyMs: null }), 180);
 });
 test('selectRacers puts the healthiest resolver first and keeps all three', () => {
-  const mk = (order, score, ewmaLatencyMs = null) => ({ url: `u${order}`, order, score, ewmaLatencyMs });
-  const racers = __internals.selectRacers([mk(0, 40), mk(1, 100, 50), mk(2, 70)]);
+  const racers = __internals.selectRacers([mkNode(0, 40), mkNode(1, 100, 50), mkNode(2, 70)]);
   assert.equal(racers.length, 3);
   assert.equal(racers[0].order, 1);
   assert.deepEqual(racers.map((n) => n.order).sort(), [0, 1, 2]);
@@ -890,19 +898,29 @@ test('corrupt L2 entries are purged instead of being re-read forever', async () 
   const key = await __internals.makeCacheKey(query);
   let matches = 0;
   let deletes = 0;
+  let upstreamCalls = 0;
   await withGlobalRuntimeMocks(async () => {
-    await postQuery('corrupt.example', 'corrupt-test');
-    await postQuery('corrupt.example', 'corrupt-test');
-    assert.equal(matches, 2);
+    // First request: the stored entry lacks its bookkeeping headers, so it is purged and resolved upstream.
+    const first = await postQuery('corrupt.example', 'corrupt-test');
+    assert.equal(first.status, 200);
+    assert.equal(first.headers.get('x-cache'), 'MISS');
+    // Second request: the fresh answer is in L1, so the corrupt L2 entry is not read again.
+    const second = await postQuery('corrupt.example', 'corrupt-test');
+    assert.equal(second.status, 200);
+    assert.equal(second.headers.get('x-cache'), 'L1-HIT');
+    assert.equal(matches, 1);
     assert.equal(deletes, 1);
+    assert.equal(upstreamCalls, 1);
   }, {
-    fetch: async () => { throw new Error('upstream must not be used'); },
+    fetch: async (_url, init) => {
+      upstreamCalls += 1;
+      return okResponse(init);
+    },
     caches: {
       default: {
         match: async (req) => {
           if (!req.url.endsWith(key)) return null;
           matches += 1;
-          if (matches > 1) return null;
           // Body is fine but the bookkeeping headers are missing: corrupt.
           return new Response(makeAResponse(query, 100).buffer);
         },
@@ -954,6 +972,16 @@ test('validateDNSResponse accepts case-reordered QNAME echoes (0x20 randomizatio
   const validation = __internals.validateDNSResponse(response, 0x1234, query);
   assert.equal(validation.ok, true);
   assert.equal(validation.rcode, 0);
+});
+test('questionless error responses keep their record bytes when the client QNAME differs in case', () => {
+  const name = [3, 119, 119, 119, 7, 101, 120, 97, 109, 112, 108, 101, 0]; // www.example, lower case
+  // SERVFAIL with no question section and one A record for www.example.
+  const response = Uint8Array.from([0x42, 0x42, 0x81, 0x82, 0, 0, 0, 1, 0, 0, 0, 0,
+    ...name, 0, 1, 0, 1, ...u32(60), 0, 4, 1, 2, 3, 4]);
+  const query = makeQuery('WWW.EXAMPLE'); // upper-case client query, transaction ID 0x1234
+  const { metadata } = __internals.validateDNSMessage(response);
+  const out = new Uint8Array(__internals.patchDNSResponseForAge(response, 0x1234, 0, query, metadata));
+  assert.deepEqual(Array.from(out.slice(12, 12 + name.length)), name);
 });
 test('validateDNSResponse rejects success answers without a question but accepts error ones', () => {
   const query = makeQuery('noq.example');

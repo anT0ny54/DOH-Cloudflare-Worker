@@ -44,7 +44,7 @@ function resetAppState() {
   APP_STATE.lastSweepAt = 0;
 }
 export const __internals = {
-  CONFIG, RESOLVER_NODES, rateLimitKey, recoverScore, fallbackPriority, getHealthSnapshot,
+  CONFIG, RESOLVER_NODES, rateLimitKey, recoverScore, reward, fallbackPriority, getHealthSnapshot,
   parseDNSQuestion,
   validateDNSResponse: (body, id, query) => validateDNSMessage(body, {
     expectedID: id ?? null, queryBytes: query ?? null, questionEnd: query ? questionEndOf(query) : null

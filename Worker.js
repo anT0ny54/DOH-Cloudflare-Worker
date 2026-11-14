@@ -319,9 +319,10 @@ async function readCappedBody(source, maxBytes, tooLargeMessage) {
   } finally {
     reader.releaseLock();
   }
-  // Fast path: a lone chunk is returned as-is. Callers convert it with
-  // toExactArrayBuffer(), which preserves the view's exact byte range when the
-  // chunk is a subarray of a larger backing buffer.
+  // Fast path: a lone chunk is returned as-is, so it may be a view into a
+  // larger backing buffer. Upstream and L2 bodies convert it with
+  // toExactArrayBuffer() before use. The client query only takes indexed
+  // reads, so it needs no conversion.
   if (chunks.length === 1) return chunks[0];
   const out = new Uint8Array(total);
   let offset = 0;
@@ -355,8 +356,7 @@ function encodeBase64Url(bytes) {
   }
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
-function parseDNSQuestion(packet) {
-  const bytes = packet;
+function parseDNSQuestion(bytes) {
   if (bytes.byteLength < 12) {
     return { ok: false, error: 'DNS message too short' };
   }
@@ -788,8 +788,11 @@ function reward(node, latencyMs) {
   adjustScore(node, CONFIG.SCORE_SUCCESS_DELTA);
 }
 function adjustScore(node, delta) {
+  // Apply the recovery owed since the last update first, then leave the
+  // recovery clock where it is. Resetting it here would discard any partial
+  // minute, so a resolver with frequent results would never recover.
+  recoverScore(node);
   node.score = clamp(node.score + delta, CONFIG.SCORE_MIN, CONFIG.SCORE_MAX);
-  node.lastScoreUpdateAt = Date.now();
 }
 // The attempt was still running when a later-started hedge won. Its elapsed
 // time is a lower bound on its latency, so it may only raise the estimate.
@@ -906,10 +909,14 @@ function setCache(key, body, ttlSeconds, storedAt, metadata) {
     deleteCache(APP_STATE.cache.keys().next().value);
   }
 }
-function skipDNSName(bytes, offset, allowPointer = true, nameBoundaries = null) {
+// Label start offsets of the name currently being walked. skipDNSName() never
+// re-enters itself, so one array is reused instead of allocated for every name.
+const LABEL_STARTS = [];
+function skipDNSName(bytes, offset, allowPointer, nameBoundaries) {
   let pos = offset;
   let wireLength = 1;
-  const labelStarts = nameBoundaries ? [] : null;
+  const labelStarts = nameBoundaries ? LABEL_STARTS : null;
+  if (labelStarts) labelStarts.length = 0;
   while (pos < bytes.length) {
     const len = bytes[pos];
     if (len === 0) {
@@ -945,7 +952,7 @@ function skipDNSName(bytes, offset, allowPointer = true, nameBoundaries = null) 
 // well-formed name: labels in bounds, terminating in a root label or another
 // valid backward pointer, within the 255-byte wire limit. The caller's
 // boundary set additionally proves that its target starts at a parsed label.
-function isValidNamePointerTarget(bytes, target, pointerPos, wireLength = 1) {
+function isValidNamePointerTarget(bytes, target, pointerPos, wireLength) {
   let from = pointerPos;
   let pos = target;
   for (let hops = 0; hops < 128; hops++) {
@@ -985,7 +992,7 @@ function readResourceRecord(bytes, offset, nameBoundaries = null) {
   if (rdEnd > bytes.length) return null;
   return { type, ttl, rdataOffset, rdEnd };
 }
-function findSOAMinimumOffset(bytes, rdataOffset, rdEnd, nameBoundaries = null) {
+function findSOAMinimumOffset(bytes, rdataOffset, rdEnd, nameBoundaries) {
   let pos = skipDNSName(bytes, rdataOffset, true, nameBoundaries);
   if (pos < 0 || pos >= rdEnd) return -1;
   pos = skipDNSName(bytes, pos, true, nameBoundaries);
@@ -997,15 +1004,15 @@ function findSOAMinimumOffset(bytes, rdataOffset, rdEnd, nameBoundaries = null) 
 }
 // These helpers are shared across records to avoid allocating several small
 // closures for every RR in an upstream response.
-function rdataNameEndAt(bytes, offset, end, allowPointer = true, nameBoundaries = null) {
+function rdataNameEndAt(bytes, offset, end, allowPointer, nameBoundaries) {
   if (offset < 0 || offset >= end) return -1;
   const next = skipDNSName(bytes, offset, allowPointer, nameBoundaries);
   return next >= 0 && next <= end ? next : -1;
 }
-function rdataOneName(bytes, end, offset, allowPointer = true, nameBoundaries = null) {
+function rdataOneName(bytes, end, offset, allowPointer, nameBoundaries) {
   return rdataNameEndAt(bytes, offset, end, allowPointer, nameBoundaries) === end;
 }
-function rdataTwoNames(bytes, end, offset, allowPointer = true, nameBoundaries = null) {
+function rdataTwoNames(bytes, end, offset, allowPointer, nameBoundaries) {
   const first = rdataNameEndAt(bytes, offset, end, allowPointer, nameBoundaries);
   if (first < 0) return false;
   return rdataNameEndAt(bytes, first, end, allowPointer, nameBoundaries) === end;
@@ -1034,7 +1041,7 @@ function validRdataTypeBitmap(bytes, offset, end) {
 // opaque (their formats may be defined by extensions the Worker does not know),
 // but common fixed-size and domain-name-bearing records must not smuggle a
 // malformed name or field sequence into a response that can be relayed/cached.
-function validateKnownRdata(bytes, rr, nameBoundaries = null) {
+function validateKnownRdata(bytes, rr, nameBoundaries) {
   const { type, rdataOffset: start, rdEnd: end } = rr;
   const length = end - start;
   switch (type) {
@@ -1081,7 +1088,6 @@ function validateKnownRdata(bytes, rr, nameBoundaries = null) {
     }
 
     case 13: { // HINFO has exactly two character strings.
-      if (length < 2) return false;
       const first = rdataCharStringEnd(bytes, start, end);
       if (first < 0) return false;
       return rdataCharStringEnd(bytes, first, end) === end;
@@ -1425,10 +1431,10 @@ function localRateLimit(ip) {
   return stats.count <= CONFIG.RATE_LIMIT_MAX_REQUESTS;
 }
 function trimThrottleMap() {
+  const now = Date.now();
   while (APP_STATE.throttle.size > CONFIG.MAX_THROTTLE_ENTRIES) {
     const oldestKey = APP_STATE.throttle.keys().next().value;
     const stats = APP_STATE.throttle.get(oldestKey);
-    const now = Date.now();
     APP_STATE.throttle.delete(oldestKey);
     if (stats && now < stats.resetAt) {
       APP_STATE.penalty.delete(oldestKey);
@@ -1812,11 +1818,11 @@ function buildUITemplate() {
 }
 // The page differs between requests only in its endpoint, so the last page
 // rendered is kept and reused while the endpoint stays the same.
-let UI_PAGE = { endpoint: null, html: null };
+let UI_PAGE = { host: null, html: null };
 function renderUI(host) {
-  const endpoint = escapeHtml(`https://${host}${CONFIG.DNS_PATH}`);
-  if (UI_PAGE.endpoint !== endpoint) {
-    UI_PAGE = { endpoint, html: getUITemplate().join(endpoint) };
+  if (UI_PAGE.host !== host) {
+    const endpoint = escapeHtml(`https://${host}${CONFIG.DNS_PATH}`);
+    UI_PAGE = { host, html: getUITemplate().join(endpoint) };
   }
   return new Response(UI_PAGE.html, {
     status: 200,

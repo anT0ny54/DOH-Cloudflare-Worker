@@ -765,20 +765,15 @@ test('concurrent cold-cache misses coalesce into a single upstream job', async (
   let releaseUpstream;
   const gate = new Promise((resolve) => { releaseUpstream = resolve; });
   await withGlobalRuntimeMocks(async () => {
-    const pending = Promise.all([
-      postQuery('race.example', 'race-1'),
-      postQuery('race.example', 'race-2'),
-      postQuery('race.example', 'race-3')
-    ]);
-    // Hold the upstream open until all three requests arrived, so the two
-    // joiners must attach to the leader's inflight job (an instant mock would
-    // let them observe the filled L1 instead).
-    for (let i = 0; i < 100 && calls === 0; i++) {
-      await new Promise((resolve) => setTimeout(resolve, 1));
-    }
-    assert.equal(calls, 1);
+    const leader = postQuery('race.example', 'race-1');
+    await waitForInflight('race.example');
+    const joiners = [postQuery('race.example', 'race-2'), postQuery('race.example', 'race-3')];
+    // Hold the upstream open until both joiners attached to the leader's
+    // inflight job (an instant mock would let them observe the filled L1).
+    await waitForJoiners('race.example', 2);
+    await waitUntilTrue(() => calls === 1);
     releaseUpstream();
-    const results = await pending;
+    const results = await Promise.all([leader, ...joiners]);
     for (const res of results) assert.equal(res.status, 200);
     const tags = results.map((r) => r.headers.get('x-cache'));
     assert.equal(tags.filter((tag) => tag === 'MISS').length, 1);
@@ -1736,6 +1731,29 @@ test('/health reports scores after time-based recovery', () => {
   node.score = 90;
   node.lastScoreUpdateAt = Date.now() - 3 * CFG.SCORE_RECOVERY_INTERVAL_MS;
   assert.equal(__internals.getHealthSnapshot().upstreams[0].score, 93);
+});
+test('successes do not discard time-based score recovery', () => {
+  const realNow = Date.now;
+  let now = realNow();
+  Date.now = () => now;
+  try {
+    const node = {
+      url: 'u0', order: 0, score: 50, lastScoreUpdateAt: now,
+      ok: 0, fail: 0, timeout: 0, slow: 0,
+      lastLatencyMs: null, ewmaLatencyMs: null, lastError: null
+    };
+    // A success every 30 s for 10 minutes. selectRacers() recovers each
+    // resolver before a resolution, so recovery is checked before every reward.
+    for (let i = 0; i < 20; i++) {
+      now += 30_000;
+      __internals.recoverScore(node, now);
+      __internals.reward(node, 100);
+    }
+    // Ten minutes of recovery (+10) plus twenty successes (+20).
+    assert.equal(node.score, 80);
+  } finally {
+    Date.now = realNow;
+  }
 });
 test('EDNS padding presence stays in the cache key, its length does not', () => {
   const query = makeQuery('pad-presence.example');

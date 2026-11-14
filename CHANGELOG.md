@@ -2,6 +2,32 @@
 
 All notable changes to this project are documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Successes and penalties no longer discard time-based resolver score recovery. Recovery owed since the last update is applied first, and the recovery clock keeps running, so a resolver with frequent results recovers at +1 per minute as documented.
+- The cold-miss coalescing test waits on the joiner counter instead of a fixed poll loop, as the README describes.
+- The README shows the escaped dashboard selector `.md\:p-12` with one backslash, matching the CSS the Worker serves.
+
+### Changed
+
+- The dashboard page is keyed by host, so repeated requests for the same host skip re-escaping and re-joining the template.
+- `skipDNSName()` reuses one label scratch array instead of allocating one per name.
+- `trimThrottleMap()` reads the clock once per eviction pass.
+- Corrected a comment in `readCappedBody()` that claimed every caller converts a lone chunk.
+
+### Removed
+
+- Redundant `const bytes = packet` alias in `parseDNSQuestion()`.
+- Redundant HINFO length check in `validateKnownRdata()`.
+- Unused default parameter values on `skipDNSName()`, `isValidNamePointerTarget()`, `findSOAMinimumOffset()`, `rdataNameEndAt()`, `rdataOneName()`, `rdataTwoNames()` and `validateKnownRdata()`. Every call site passes these arguments.
+
+### Tests
+
+- Regression test: successes do not discard time-based score recovery.
+- The Node.js suite contains 134 tests.
+
 ## [0.5.7] - 2026-10-28
 
 ### Fixed

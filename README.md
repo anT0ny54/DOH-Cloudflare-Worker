@@ -1,6 +1,6 @@
 # 🛡️ DoH — Cloudflare Worker
 
-A lightweight Cloudflare Worker that exposes a standard **DNS-over-HTTPS** endpoint, uses three HaGeZi resolvers with intelligent staged failover, and keeps a two-level DNS cache (Worker version 0.5.7; 133-test suite):
+A lightweight Cloudflare Worker that exposes a standard **DNS-over-HTTPS** endpoint, uses three HaGeZi resolvers with intelligent staged failover, and keeps a two-level DNS cache (Worker version 0.5.7; 134-test suite):
 
 ```txt
 L1: per-isolate memory cache
@@ -38,7 +38,7 @@ The resolver logic never launches all three upstreams immediately. In-flight dup
 - The first-choice pool holds the resolvers whose score is less than 8 points below the best one (score above best minus 8), so a single timeout (-8) removes a resolver from it. Inside the pool, the resolver with the lowest learned latency (EWMA) goes first; every 10th upstream resolution another pool member goes first so its latency estimate stays current. Resolvers outside the pool follow in score/latency order.
 - A backup is started if the first attempt has not answered after `1.5 x` its learned latency (clamped to 80-220 ms, so the 120 ms assumed before any sample gives 180 ms) or as soon as it fails. The last-resort resolver is started after a further 150 ms, or immediately when the first two have both failed. The delay timer restarts whenever any attempt settles, so these delays are measured from the most recent event rather than from the start of the request.
 - Each upstream attempt is aborted after 1200 ms. A truncated (TC) answer is treated as unusable so that a resolver returning a complete answer wins. If no resolver produces a usable answer but at least one returned a DNS message, the best fallback is relayed: truncated `NOERROR`, then truncated `NXDOMAIN`, then `SERVFAIL`, then other RCODEs. It is relayed to the client (`x-dns-degraded: 1`); if none returns a DNS message at all, the client gets `502`.
-- Scores recover over time by +1 per minute up to 100, so one transient failure cannot keep a resolver out of the first-choice pool indefinitely. `/health` applies this recovery before reporting scores. A broken domain that makes every resolver return `SERVFAIL` (or another error RCODE, or a truncated answer) does not lower any score.
+- Scores recover over time by +1 per minute up to 100, so one transient failure cannot keep a resolver out of the first-choice pool indefinitely. Successes and penalties do not reset this recovery clock. `/health` applies this recovery before reporting scores. A broken domain that makes every resolver return `SERVFAIL` (or another error RCODE, or a truncated answer) does not lower any score.
 - Scores, counters, the L1 cache and the in-flight table live in each isolate's memory. They are not shared between isolates or data centers, and `/health` shows only the state of the isolate that answered it.
 
 ### Two-level DNS cache
@@ -132,7 +132,7 @@ Run the included Node.js unit tests from the project folder. Use Node.js 22 or n
 npm test        # or: node --test
 ```
 
-The suite (133 tests) mocks `fetch` and the Cache API, so it needs no network or Cloudflare account. Test-only hooks live in `worker-harness.mjs`, which appends them to a temporary copy of `Worker.js` and deletes that copy once it is imported; the deployed Worker exports only its default fetch handler. Coalescing tests wait on the harness's joiner counter instead of fixed sleeps. CI also runs `node --check Worker.js` and `npm run check` (`wrangler deploy --dry-run` with Wrangler pinned to 4.151.0) to validate the bundle and `wrangler.toml` without deploying.
+The suite (134 tests) mocks `fetch` and the Cache API, so it needs no network or Cloudflare account. Test-only hooks live in `worker-harness.mjs`, which appends them to a temporary copy of `Worker.js` and deletes that copy once it is imported; the deployed Worker exports only its default fetch handler. Coalescing tests wait on the harness's joiner counter instead of fixed sleeps. CI also runs `node --check Worker.js` and `npm run check` (`wrangler deploy --dry-run` with Wrangler pinned to 4.151.0) to validate the bundle and `wrangler.toml` without deploying.
 
 ### Verifying a deployment
 

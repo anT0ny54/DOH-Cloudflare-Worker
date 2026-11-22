@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const hooks = `
+const TEST_JOINER_COUNTS = new WeakMap();
 function questionEndOf(query) {
   return parseDNSQuestion(query instanceof Uint8Array ? query : new Uint8Array(query)).questionEnd;
 }
@@ -72,17 +73,31 @@ export const __internals = {
     setCache(key, body, ttl, storedAt, metadata ?? metadataOf(body)),
   resetAppState,
   hasInflight: (query) => APP_STATE.inflight.has(localKeyOf(query)),
-  joinerCount: (query) => APP_STATE.inflight.get(localKeyOf(query))?.joiners ?? 0,
+  joinerCount: (query) => {
+    const entry = APP_STATE.inflight.get(localKeyOf(query));
+    return entry ? (TEST_JOINER_COUNTS.get(entry) ?? 0) : 0;
+  },
   inflightEntry: (query) => APP_STATE.inflight.get(localKeyOf(query)) ?? null,
   injectInflight: (query, entry) => APP_STATE.inflight.set(localKeyOf(query), entry)
 };
 `;
 const source = await readFile(new URL('./Worker.js', import.meta.url), 'utf8');
+// Inject coalescing instrumentation only into the temporary test copy. The
+// deployed Worker therefore carries no joiner counter or test-only write.
+const joinMarker = '  if (existing) {\n    const outcome = await settleWithin(existing.job, CONFIG.INFLIGHT_JOIN_TIMEOUT_MS);';
+const joinMarkerCount = source.split(joinMarker).length - 1;
+if (joinMarkerCount !== 1) {
+  throw new Error(`Expected exactly one Worker coalescing hook location, found ${joinMarkerCount}`);
+}
+const instrumentedSource = source.replace(
+  joinMarker,
+  '  if (existing) {\n    TEST_JOINER_COUNTS.set(existing, (TEST_JOINER_COUNTS.get(existing) ?? 0) + 1);\n    const outcome = await settleWithin(existing.job, CONFIG.INFLIGHT_JOIN_TIMEOUT_MS);'
+);
 const dir = await mkdtemp(join(tmpdir(), 'doh-worker-test-'));
 const file = join(dir, 'Worker.test.mjs');
-await writeFile(file, `${source}\n${hooks}`);
 let module;
 try {
+  await writeFile(file, `${instrumentedSource}\n${hooks}`);
   module = await import(pathToFileURL(file));
 } finally {
   await rm(dir, { recursive: true, force: true });

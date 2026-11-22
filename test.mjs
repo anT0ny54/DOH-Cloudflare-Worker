@@ -235,7 +235,6 @@ test('validateDNSResponse rejects compressed targets in DNAME, KX, LP and IPSECK
     makeRecordResponse(query, 36, [0, 10, 0xc0, 0x0c]), // KX exchange name cannot be compressed.
     makeRecordResponse(query, 39, [0xc0, 0x0c]), // DNAME target names cannot be compressed.
     makeRecordResponse(query, 45, [10, 3, 2, 0xc0, 0x0c, 1]), // IPSECKEY gateway cannot be compressed.
-    makeRecordResponse(query, 45, [10, 0, 2, 1, 2, 3]), // Gateway type 0 still requires the root gateway field.
     makeRecordResponse(query, 45, [10, 3, 0, 0, 1, 2, 3]), // Algorithm 0 must not carry a public key.
     makeRecordResponse(query, 58, [0xc0, 0x0c, 0xc0, 0x0c]), // TALINK names cannot be compressed.
     makeRecordResponse(query, 107, [0, 10, 0xc0, 0x0c]) // LP FQDN cannot be compressed.
@@ -247,8 +246,25 @@ test('validateDNSResponse rejects compressed targets in DNAME, KX, LP and IPSECK
   }
   const validIPSECKEY = makeRecordResponse(query, 45, [10, 3, 2, 0, 1, 2, 3]);
   assert.equal(__internals.validateDNSResponse(validIPSECKEY, 0x1234, query).ok, true);
-  const validNullGatewayIPSECKEY = makeRecordResponse(query, 45, [10, 0, 2, 0, 1, 2, 3]);
-  assert.equal(__internals.validateDNSResponse(validNullGatewayIPSECKEY, 0x1234, query).ok, true);
+  const validNoGatewayIPSECKEY = makeRecordResponse(query, 45, [10, 0, 2, 1, 2, 3]);
+  assert.equal(__internals.validateDNSResponse(validNoGatewayIPSECKEY, 0x1234, query).ok, true);
+});
+test('IPSECKEY Gateway Type 0 has no gateway octets (RFC 4025)', () => {
+  const query = makeQuery('ipseckey-no-gateway.example');
+  // RFC 4025's presentation form uses '.' for an absent gateway, but the
+  // wire-format gateway field is zero octets. Algorithm 0 likewise has no key.
+  for (const rdata of [
+    [10, 0, 0],             // no gateway, no public key
+    [10, 0, 2, 1, 2, 3],    // no gateway; public key starts with a nonzero octet
+    [10, 0, 2, 0, 1, 2, 3]  // no gateway; a zero first key octet is still key data
+  ]) {
+    assert.equal(__internals.validateDNSResponse(makeRecordResponse(query, 45, rdata), 0x1234, query).ok, true);
+  }
+  // Algorithm 0 means no key, so any octet after the three-byte header is invalid.
+  assert.equal(
+    __internals.validateDNSResponse(makeRecordResponse(query, 45, [10, 0, 0, 1]), 0x1234, query).ok,
+    false
+  );
 });
 test('validateDNSResponse validates CAA tags, SPF strings and defined SVCB parameters', () => {
   const query = makeQuery('typed-parameters.example');
@@ -779,6 +795,7 @@ test('concurrent cold-cache misses coalesce into a single upstream job', async (
     // Hold the upstream open until both joiners attached to the leader's
     // inflight job (an instant mock would let them observe the filled L1).
     await waitForJoiners('race.example', 2);
+    assert.equal(Object.hasOwn(__internals.inflightEntry(makeQuery('race.example')), 'joiners'), false);
     await waitUntilTrue(() => calls === 1);
     releaseUpstream();
     const results = await Promise.all([leader, ...joiners]);
@@ -797,6 +814,39 @@ test('concurrent cold-cache misses coalesce into a single upstream job', async (
     },
     caches: cacheMock()
   });
+});
+test('in-flight tracking evicts its oldest key at capacity and stays bounded', async () => {
+  const names = Array.from({ length: CFG.MAX_INFLIGHT_ENTRIES }, (_, i) => `tracked-${i}.example`);
+  const first = makeQuery(names[0]);
+  const second = makeQuery(names[1]);
+  let releaseUpstream;
+  const gate = new Promise((resolve) => { releaseUpstream = resolve; });
+  try {
+    await withGlobalRuntimeMocks(async () => {
+      for (const name of names) {
+        __internals.injectInflight(makeQuery(name), {
+          job: new Promise(() => {}), createdAt: Date.now()
+        });
+      }
+      assert.equal(__internals.getHealthSnapshot().inflightEntries, CFG.MAX_INFLIGHT_ENTRIES);
+      const request = postQuery('overflow.example', 'overflow');
+      await waitForInflight('overflow.example');
+      assert.equal(__internals.hasInflight(first), false);
+      assert.equal(__internals.hasInflight(second), true);
+      assert.equal(__internals.hasInflight(makeQuery('overflow.example')), true);
+      assert.equal(__internals.getHealthSnapshot().inflightEntries, CFG.MAX_INFLIGHT_ENTRIES);
+      releaseUpstream();
+      assert.equal((await request).status, 200);
+    }, {
+      fetch: async (_url, init) => {
+        await gate;
+        return okResponse(init);
+      },
+      caches: cacheMock()
+    });
+  } finally {
+    __internals.resetAppState();
+  }
 });
 test('getDNSCacheTTL treats SOA MINIMUM with the MSB set as zero (RFC 2181)', () => {
   const query = makeQuery('soamsb.example');
@@ -1524,7 +1574,7 @@ test('fallback priority: truncated NOERROR > truncated NXDOMAIN > SERVFAIL > oth
   assert.ok(p(2) > p(5));
   assert.equal(p(5), p(4));
 });
-test('resolver scores recover over time to the starting score', () => {
+test('resolver scores recover one point per recovery interval', () => {
   const node = { score: 80, lastScoreUpdateAt: 1 };
   __internals.recoverScore(node, 1 + 5 * __internals.CONFIG.SCORE_RECOVERY_INTERVAL_MS);
   assert.equal(node.score, 85);
@@ -1650,10 +1700,7 @@ function neverAnswers(init) {
   return new Promise((_resolve, reject) => init.signal.addEventListener('abort', () => reject(new Error('aborted'))));
 }
 function withPadding(query, len) {
-  const out = Array.from(withOPT(query));
-  out[out.length - 1] = len + 4; // OPT rdlength
-  out.push(0, 12, 0, len, ...new Array(len).fill(0));
-  return Uint8Array.from(out);
+  return withOptRdata(query, [0, 12, 0, len, ...new Array(len).fill(0)]);
 }
 function mkNode(order, score, ewmaLatencyMs) {
   return { url: `u${order}`, order, score, ewmaLatencyMs, lastScoreUpdateAt: Date.now() };
@@ -1777,7 +1824,7 @@ test('a stale in-flight entry is ignored and replaced', async () => {
   const query = makeQuery('stale.example');
   await withGlobalRuntimeMocks(async () => {
     __internals.injectInflight(query, {
-      job: new Promise(() => {}), createdAt: Date.now() - CFG.INFLIGHT_JOIN_TIMEOUT_MS - 1, joiners: 0
+      job: new Promise(() => {}), createdAt: Date.now() - CFG.INFLIGHT_JOIN_TIMEOUT_MS - 1
     });
     const res = await postQuery('stale.example', 'stale');
     assert.equal(res.status, 200);
@@ -1787,7 +1834,7 @@ test('a stale in-flight entry is ignored and replaced', async () => {
     // never requested again, instead of leaving it in /health state forever.
     __internals.resetAppState();
     __internals.injectInflight(query, {
-      job: new Promise(() => {}), createdAt: Date.now() - CFG.INFLIGHT_JOIN_TIMEOUT_MS - 1, joiners: 0
+      job: new Promise(() => {}), createdAt: Date.now() - CFG.INFLIGHT_JOIN_TIMEOUT_MS - 1
     });
     await worker.fetch(new Request('https://workers.example/health'), {}, {});
     assert.equal(__internals.hasInflight(query), false);
@@ -1798,7 +1845,7 @@ test('a joiner whose leader never settles resolves on its own after the join tim
   CFG.INFLIGHT_JOIN_TIMEOUT_MS = 30;
   try {
     await withGlobalRuntimeMocks(async () => {
-      __internals.injectInflight(makeQuery('lost-leader.example'), { job: new Promise(() => {}), createdAt: Date.now(), joiners: 0 });
+      __internals.injectInflight(makeQuery('lost-leader.example'), { job: new Promise(() => {}), createdAt: Date.now() });
       const res = await postQuery('lost-leader.example', 'lost-leader');
       assert.equal(res.status, 200);
       assert.equal(res.headers.get('x-cache'), 'MISS');

@@ -118,7 +118,6 @@ async function handleDNS(req, url, ctx) {
   if (localHit) return l1Response(localHit, parsed.id, payload);
   const existing = getLiveInflight(key);
   if (existing) {
-    existing.joiners += 1;
     const outcome = await settleWithin(existing.job, CONFIG.INFLIGHT_JOIN_TIMEOUT_MS);
     if (outcome.status === 'fulfilled') return sharedDNSResponse(outcome.value, parsed, payload, 'COALESCED');
     if (outcome.status === 'rejected') return upstreamFailureResponse(0);
@@ -140,9 +139,7 @@ async function handleDNS(req, url, ctx) {
 // request is cancelled, the job still settles, joiners are released and the
 // in-flight entry is removed.
 function startJob(key, keyBytes, payload, parsed, origin, ctx) {
-  // `joiners` is bookkeeping read only by the test harness (it lets tests wait
-  // deterministically until requests have attached to this job).
-  const entry = { job: null, createdAt: Date.now(), joiners: 0 };
+  const entry = { job: null, createdAt: Date.now() };
   entry.job = resolveShared(key, keyBytes, payload, parsed, origin, ctx).finally(() => {
     if (APP_STATE.inflight.get(key) === entry) APP_STATE.inflight.delete(key);
   });
@@ -1142,9 +1139,9 @@ function validateKnownRdata(bytes, rr, nameBoundaries) {
       const gatewayStart = start + 3;
       let gatewayEnd;
       if (gatewayType === 0) {
-        // Even with "no gateway", the required gateway field is the root name.
-        if (gatewayStart >= end || bytes[gatewayStart] !== 0) return false;
-        gatewayEnd = gatewayStart + 1;
+        // RFC 4025: Gateway Type 0 means no gateway octets are present.
+        // The "." used in zone-file presentation is not a wire-format root name.
+        gatewayEnd = gatewayStart;
       } else if (gatewayType === 1) {
         gatewayEnd = gatewayStart + 4;
         if (gatewayEnd > end) return false;
@@ -1570,7 +1567,7 @@ function escapeHtml(value) {
   }[ch]));
 }
 // The dashboard markup only differs per request in the endpoint URL, so the
-// ~15KB template is built once and cached at module scope.
+// ~21KB template is built once and cached at module scope.
 let UI_TEMPLATE = null;
 function getUITemplate() {
   if (UI_TEMPLATE) return UI_TEMPLATE;

@@ -1,6 +1,10 @@
 name = "secure-doh-worker"
 main = "Worker.js"
 compatibility_date = "2026-09-26"
+# Minifies the uploaded bundle (about 80 KiB -> 52 KiB). For a representative
+# request set, the dashboard HTML and every DNS response matched the unminified
+# build. Tests run on the unminified Worker.js source.
+minify = true
 
 # Keep this namespace unique when rate-limit counter isolation matters.
 # limit/period must match CONFIG.RATE_LIMIT_* in Worker.js (enforced by a test).

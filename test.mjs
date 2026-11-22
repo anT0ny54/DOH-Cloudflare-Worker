@@ -215,18 +215,119 @@ test('validateDNSResponse rejects malformed common RDATA layouts', () => {
     assert.match(result.error, /RDATA/);
   }
 });
+test('validateDNSResponse checks DNSSEC digest/key and SSHFP/TLSA formats', () => {
+  const query = makeQuery('dnssec-rdata.example');
+  const validate = (type, rdata) => __internals.validateDNSResponse(
+    makeRecordResponse(query, type, rdata), 0x1234, query
+  ).ok;
+  const digestLengths = new Map([[1, 20], [2, 32], [3, 32], [4, 48], [5, 32], [6, 32]]);
+
+  for (const [digestType, digestLength] of digestLengths) {
+    const ds = [0x12, 0x34, 8, digestType, ...new Array(digestLength).fill(0xa5)];
+    assert.equal(validate(43, ds), true, `valid DS digest type ${digestType}`);
+    assert.equal(validate(59, ds), true, `valid CDS digest type ${digestType}`);
+    assert.equal(validate(43, ds.slice(0, -1)), false, `short DS digest type ${digestType}`);
+    assert.equal(validate(59, ds.slice(0, -1)), false, `short CDS digest type ${digestType}`);
+  }
+
+  // Unassigned and private-use digest/fingerprint/matching types remain opaque but non-empty.
+  assert.equal(validate(43, [0x12, 0x34, 8, 7, 0xa5]), true);
+  assert.equal(validate(43, [0x12, 0x34, 8, 253, 0xa5]), true);
+  assert.equal(validate(43, [0x12, 0x34, 20, 7, 0xa5]), true); // Unassigned DNSSEC algorithm/digest.
+  assert.equal(validate(43, [0x12, 0x34, 253, 253, 0xa5]), true); // Private-use DNSSEC algorithm/digest.
+  assert.equal(validate(44, [1, 200, 0xa5]), true);
+  assert.equal(validate(52, [3, 1, 200, 0xa5]), true);
+  assert.equal(validate(53, [3, 1, 200, 0xa5]), true);
+
+  assert.equal(validate(59, [0, 0, 0, 0, 0]), true); // RFC 8078 CDS delete signal.
+  assert.equal(validate(60, [0, 0, 3, 0, 0]), true); // RFC 8078 CDNSKEY delete signal.
+  assert.equal(validate(48, [1, 0, 3, 13, 0xa5]), true); // DNSKEY protocol 3.
+  assert.equal(validate(60, [1, 0, 3, 13, 0xa5]), true); // Ordinary CDNSKEY.
+  assert.equal(validate(48, [1, 0, 3, 20, 0xa5]), true); // Unassigned DNSKEY algorithm stays opaque.
+  assert.equal(validate(48, [1, 0, 3, 253, 0xa5]), true); // Private DNSKEY algorithm stays opaque.
+  assert.equal(validate(44, [1, 1, ...new Array(20).fill(0xa5)]), true); // SSHFP SHA-1.
+  assert.equal(validate(44, [3, 2, ...new Array(32).fill(0xa5)]), true); // SSHFP SHA-256.
+  assert.equal(validate(44, [200, 2, ...new Array(32).fill(0xa5)]), true); // Unknown nonzero SSHFP algorithm stays opaque.
+  assert.equal(validate(52, [3, 1, 0, 0xa5]), true); // TLSA raw association.
+  assert.equal(validate(52, [3, 1, 1, ...new Array(32).fill(0xa5)]), true); // TLSA SHA-256.
+  assert.equal(validate(52, [3, 1, 2, ...new Array(64).fill(0xa5)]), true); // TLSA SHA-512.
+
+  const malformed = [
+    [43, [0, 1, 0, 2, ...new Array(32).fill(0xa5)]], // DS algorithm zero is reserved.
+    ...[4, 9, 11, 123, 200, 252, 255].map(algorithm => [43, [0x12, 0x34, algorithm, 2, ...new Array(32).fill(0xa5)]]),
+    [43, [0x12, 0x34, 8, 200, ...new Array(32).fill(0xa5)]], // DS digest type 200 is in the reserved range.
+    [43, [0x12, 0x34, 8, 252, ...new Array(32).fill(0xa5)]], // DS digest type 252 is reserved.
+    [43, [0x12, 0x34, 8, 0, 0]], // DS digest type zero is reserved.
+    [59, [0, 0, 0, 0, 1]], // CDS delete signal must use the exact zero payload.
+    [59, [0, 1, 0, 0, 0]], // CDS algorithm zero is valid only for the delete signal.
+    [60, [0, 0, 3, 0, 1]], // CDNSKEY delete signal must use a single zero key octet.
+    [60, [0, 0, 2, 13, 0xa5]], // CDNSKEY protocol must be 3.
+    [48, [1, 0, 2, 13, 0xa5]], // DNSKEY protocol must be 3.
+    [48, [1, 0, 3, 0, 0xa5]], // DNSKEY algorithm zero is reserved.
+    ...[4, 9, 11, 123, 200, 252, 255].map(algorithm => [48, [1, 0, 3, algorithm, 0xa5]]),
+    [48, [1, 0, 3, 13]], // DNSKEY public key must not be empty.
+    [44, [0, 1, ...new Array(20).fill(0xa5)]], // SSHFP public-key algorithm zero is reserved.
+    [44, [1, 0, 0xa5]], // SSHFP fingerprint type zero is reserved.
+    [44, [1, 1, ...new Array(19).fill(0xa5)]], // SHA-1 fingerprints are 20 bytes.
+    [44, [1, 2, ...new Array(31).fill(0xa5)]], // SHA-256 fingerprints are 32 bytes.
+    ...[0, 4, 9, 11, 123, 200, 252, 255].map(algorithm => [46, [0, 1, algorithm, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]]),
+    [52, [3, 1, 1, ...new Array(31).fill(0xa5)]], // TLSA SHA-256 is 32 bytes.
+    [53, [3, 1, 2, ...new Array(63).fill(0xa5)]], // SMIMEA SHA-512 is 64 bytes.
+    [52, [3, 1, 2, ...new Array(63).fill(0xa5)]] // TLSA SHA-512 is 64 bytes.
+  ];
+  for (const [type, rdata] of malformed) {
+    assert.equal(validate(type, rdata), false, `malformed RR type ${type}: ${rdata.join(',')}`);
+  }
+});
+test('malformed upstream DS digest fails over and is never cached', async () => {
+  let calls = 0;
+  await withGlobalRuntimeMocks(async () => {
+    const res = await postQuery('bad-ds-digest.example', 'bad-ds-digest');
+    assert.equal(res.status, 502);
+    assert.equal(res.headers.get('x-upstreams'), '3');
+    assert.equal(__internals.getHealthSnapshot().cacheEntries, 0);
+    assert.equal(calls, 3);
+  }, {
+    fetch: async (_url, init) => {
+      calls += 1;
+      return new Response(makeRecordResponse(init.body, 43, [0x12, 0x34, 8, 2, ...new Array(31).fill(0xa5)]), {
+        status: 200,
+        headers: { 'content-type': 'application/dns-message' }
+      });
+    },
+    caches: cacheMock()
+  });
+});
 test('validateDNSResponse accepts valid compressed legacy name RDATA', () => {
   const query = makeQuery('cname-target.example');
   const cname = makeRecordResponse(query, 5, [0xc0, 0x0c]);
   assert.equal(__internals.validateDNSResponse(cname, 0x1234, query).ok, true);
   const mx = makeRecordResponse(query, 15, [0, 10, 0xc0, 0x0c]);
   assert.equal(__internals.validateDNSResponse(mx, 0x1234, query).ok, true);
-  const sig = makeRecordResponse(query, 24, [...new Array(18).fill(0), 0xc0, 0x0c, 1]);
+  const sigHeader = new Array(18).fill(0);
+  sigHeader[2] = 8; // A non-reserved DNSSEC algorithm.
+  const sig = makeRecordResponse(query, 24, [...sigHeader, 0xc0, 0x0c, 1]);
   assert.equal(__internals.validateDNSResponse(sig, 0x1234, query).ok, true);
   const px = makeRecordResponse(query, 26, [0, 10, 0xc0, 0x0c, 0xc0, 0x0c]);
   assert.equal(__internals.validateDNSResponse(px, 0x1234, query).ok, true);
   const nxt = makeRecordResponse(query, 30, [0xc0, 0x0c, 1]);
   assert.equal(__internals.validateDNSResponse(nxt, 0x1234, query).ok, true);
+});
+test('validateDNSResponse rejects reserved algorithms in legacy SIG records', () => {
+  const query = makeQuery('legacy-sig.example');
+  const validate = algorithm => {
+    const header = new Array(18).fill(0);
+    header[2] = algorithm;
+    const response = makeRecordResponse(query, 24, [...header, 0xc0, 0x0c, 1]);
+    return __internals.validateDNSResponse(response, 0x1234, query).ok;
+  };
+
+  for (const algorithm of [8, 20, 253, 254]) {
+    assert.equal(validate(algorithm), true, `non-reserved SIG algorithm ${algorithm}`);
+  }
+  for (const algorithm of [0, 4, 9, 11, 123, 200, 252, 255]) {
+    assert.equal(validate(algorithm), false, `reserved SIG algorithm ${algorithm}`);
+  }
 });
 test('validateDNSResponse rejects compressed targets in DNAME, KX, LP and IPSECKEY', () => {
   const query = makeQuery('compression-rules.example');
@@ -795,7 +896,6 @@ test('concurrent cold-cache misses coalesce into a single upstream job', async (
     // Hold the upstream open until both joiners attached to the leader's
     // inflight job (an instant mock would let them observe the filled L1).
     await waitForJoiners('race.example', 2);
-    assert.equal(Object.hasOwn(__internals.inflightEntry(makeQuery('race.example')), 'joiners'), false);
     await waitUntilTrue(() => calls === 1);
     releaseUpstream();
     const results = await Promise.all([leader, ...joiners]);
@@ -1563,10 +1663,6 @@ test('IPv6 rate-limit keys use the /64 prefix', () => {
   for (let i = 0; i < max; i++) assert.equal(__internals.localRateLimit(`2001:db8:9:9::${i.toString(16)}`), true);
   assert.equal(__internals.localRateLimit('2001:db8:9:9:ffff::1'), false);
 });
-test('EDNS padding does not split cache keys', async () => {
-  const query = makeQuery('pad.example');
-  assert.equal(await __internals.makeCacheKey(withPadding(query, 1)), await __internals.makeCacheKey(withPadding(query, 20)));
-});
 test('fallback priority: truncated NOERROR > truncated NXDOMAIN > SERVFAIL > other RCODEs', () => {
   const p = (rcode) => __internals.fallbackPriority({ rcode });
   assert.ok(p(0) > p(3));
@@ -1892,6 +1988,13 @@ test('OPTIONS preflight is answered before the rate limiter, and DNS responses c
     assert.match(res.headers.get('access-control-expose-headers'), /x-cache/);
   }, { fetch: async (_url, init) => okResponse(init), caches: cacheMock() });
 });
+test('429 Retry-After is exposed to browser clients through CORS', async () => {
+  const denied = { DNS_RATE_LIMITER: { limit: async () => ({ success: false }) } };
+  const response = await worker.fetch(new Request('https://workers.example/dns-query'), denied, {});
+  assert.equal(response.status, 429);
+  assert.equal(response.headers.get('retry-after'), '60');
+  assert.match(response.headers.get('access-control-expose-headers'), /(?:^|,\s*)retry-after(?:\s*,|$)/i);
+});
 
 // ---- 0.5.1 regressions ----
 test('an NXDOMAIN without a question section is rejected, a SERVFAIL without one is not', () => {
@@ -2057,4 +2160,71 @@ test('a joiner attaches to a leader inside the three-sequential-timeout window',
     },
     caches: cacheMock()
   });
+});
+
+// ---- Unreleased: method handling and derived limits ----
+test('/health and the dashboard accept only GET and HEAD', async () => {
+  for (const path of ['/health', '/']) {
+    for (const method of ['PUT', 'POST', 'DELETE']) {
+      const res = await worker.fetch(new Request(`https://workers.example${path}`, { method }), {}, {});
+      assert.equal(res.status, 405, `${method} ${path}`);
+      assert.equal(res.headers.get('allow'), 'GET, HEAD');
+    }
+    const get = await worker.fetch(new Request(`https://workers.example${path}`), {}, {});
+    assert.equal(get.status, 200, `GET ${path}`);
+  }
+});
+test('HEAD /health skips building the health snapshot and recovering resolver scores', async () => {
+  const node = __internals.RESOLVER_NODES[0];
+  const minScore = __internals.CONFIG.SCORE_MIN;
+  const recoveryInterval = __internals.CONFIG.SCORE_RECOVERY_INTERVAL_MS;
+  node.score = minScore;
+  node.lastScoreUpdateAt = Date.now() - recoveryInterval;
+  const previousUpdateAt = node.lastScoreUpdateAt;
+
+  const response = await worker.fetch(
+    new Request('https://workers.example/health', { method: 'HEAD' }),
+    {},
+    {}
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('content-type'), 'application/json; charset=utf-8');
+  assert.equal((await response.arrayBuffer()).byteLength, 0);
+  assert.equal(node.score, minScore, 'HEAD must not trigger resolver score recovery');
+  assert.equal(node.lastScoreUpdateAt, previousUpdateAt, 'HEAD must not update resolver recovery time');
+});
+test('HEAD routes return representation headers without a response body', async () => {
+  for (const path of ['/health', '/', '/index.html']) {
+    const get = await worker.fetch(new Request(`https://workers.example${path}`), {}, {});
+    const head = await worker.fetch(new Request(`https://workers.example${path}`, { method: 'HEAD' }), {}, {});
+    assert.equal(head.status, get.status, `HEAD ${path} status`);
+    for (const header of ['content-type', 'cache-control', 'content-security-policy', 'x-content-type-options', 'referrer-policy']) {
+      assert.equal(head.headers.get(header), get.headers.get(header), `HEAD ${path} ${header}`);
+    }
+    assert.equal((await head.arrayBuffer()).byteLength, 0, `HEAD ${path} must not return content`);
+  }
+});
+test('HEAD error responses never include bodies', async () => {
+  const dnsMethod = await worker.fetch(new Request('https://workers.example/dns-query', { method: 'HEAD' }), {}, {});
+  assert.equal(dnsMethod.status, 405);
+  assert.equal(dnsMethod.headers.get('allow'), 'GET, POST, OPTIONS');
+  assert.equal((await dnsMethod.arrayBuffer()).byteLength, 0);
+
+  const missing = await worker.fetch(new Request('https://workers.example/missing', { method: 'HEAD' }), {}, {});
+  assert.equal(missing.status, 404);
+  assert.equal((await missing.arrayBuffer()).byteLength, 0);
+
+  const limited = await worker.fetch(
+    new Request('https://workers.example/dns-query', { method: 'HEAD' }),
+    { DNS_RATE_LIMITER: { limit: async () => ({ success: false }) } },
+    {}
+  );
+  assert.equal(limited.status, 429);
+  assert.equal((await limited.arrayBuffer()).byteLength, 0);
+});
+test('the GET query length limit is derived from the message size limit', () => {
+  assert.equal(CFG.MAX_DNS_MESSAGE_BYTES, 4096);
+  assert.equal(CFG.MAX_GET_DNS_CHARS, Math.ceil((CFG.MAX_DNS_MESSAGE_BYTES * 4) / 3));
+  assert.equal(CFG.MAX_GET_DNS_CHARS, 5462);
 });

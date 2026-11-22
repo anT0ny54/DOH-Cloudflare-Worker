@@ -1,4 +1,6 @@
 const VERSION = '0.5.8';
+// Largest DNS message accepted from clients (RFC 8484 DoH recommendation).
+const MAX_DNS_MESSAGE_BYTES = 4096;
 const CONFIG = {
   DNS_PATH: '/dns-query',
   EDGE_CACHE_ENABLED: true,
@@ -22,8 +24,9 @@ const CONFIG = {
   MAX_THROTTLE_ENTRIES: 2048,
   MAX_PENALTY_ENTRIES: 256,
   STATE_SWEEP_INTERVAL_MS: 60_000,
-  MAX_DNS_MESSAGE_BYTES: 4096,
-  MAX_GET_DNS_CHARS: 5462,
+  MAX_DNS_MESSAGE_BYTES,
+  // base64url without padding: 4 characters per 3 bytes, rounded up.
+  MAX_GET_DNS_CHARS: Math.ceil((MAX_DNS_MESSAGE_BYTES * 4) / 3),
   MAX_UPSTREAM_DNS_MESSAGE_BYTES: 65_535,
   UPSTREAM_TIMEOUT_MS: 1200,
   HEDGE_MIN_MS: 80,
@@ -73,7 +76,7 @@ const APP_STATE = {
 };
 const CORS_HEADERS = {
   'access-control-allow-origin': '*',
-  'access-control-expose-headers': 'x-cache, x-edge-cache, x-upstreams, x-winner, x-winner-lat, x-dns-degraded'
+  'access-control-expose-headers': 'x-cache, x-edge-cache, x-upstreams, x-winner, x-winner-lat, x-dns-degraded, retry-after'
 };
 export default {
   async fetch(req, env, ctx) {
@@ -84,20 +87,23 @@ export default {
       if (req.method === 'OPTIONS') return preflightResponse();
       maybeSweepState();
       if (!(await allowDNSRequest(getClientIP(req), env))) {
-        return dnsErrorResponse('Rate limit exceeded', 429, { 'retry-after': '60' });
+        return headResponse(req, dnsErrorResponse('Rate limit exceeded', 429, { 'retry-after': '60' }));
       }
-      return handleDNS(req, url, ctx);
+      return headResponse(req, await handleDNS(req, url, ctx));
     }
     if (url.pathname === '/health') {
+      if (!isGetOrHead(req)) return methodNotAllowed();
       maybeSweepState();
-      return jsonResponse(getHealthSnapshot(), 200, {
+      const headOnly = req.method === 'HEAD';
+      return jsonResponse(headOnly ? null : getHealthSnapshot(), 200, {
         'cache-control': 'no-store'
-      });
+      }, headOnly);
     }
     if (url.pathname === '/' || url.pathname === '/index.html') {
-      return renderUI(url.host);
+      if (!isGetOrHead(req)) return methodNotAllowed();
+      return renderUI(url.host, req.method === 'HEAD');
     }
-    return textResponse('Not found', 404);
+    return headResponse(req, textResponse('Not found', 404));
   }
 };
 async function handleDNS(req, url, ctx) {
@@ -1040,6 +1046,68 @@ function validRdataTypeBitmap(bytes, offset, end) {
   }
   return pos === end && pos > offset;
 }
+function isReservedDNSSECAlgorithm(algorithm) {
+  // IANA DNS Security Algorithm Numbers: 4, 9, 11, 123-251 and 255 are
+  // reserved; 252 is reserved for indirect keys and cannot sign DNS zones.
+  return algorithm === 4 || algorithm === 9 || algorithm === 11
+    || (algorithm >= 123 && algorithm <= 252) || algorithm === 255;
+}
+function validDSRdata(bytes, start, end, allowDeleteSignal) {
+  const length = end - start;
+  // RFC 8078's delete signal is exactly CDS 0 0 0 0 (one zero octet of
+  // digest data); algorithm zero is otherwise not valid in DS/CDS RDATA.
+  if (allowDeleteSignal && length === 5
+      && bytes[start] === 0 && bytes[start + 1] === 0
+      && bytes[start + 2] === 0 && bytes[start + 3] === 0
+      && bytes[start + 4] === 0) return true;
+  if (length < 5 || bytes[start + 2] === 0
+      || isReservedDNSSECAlgorithm(bytes[start + 2])) return false;
+  const digestType = bytes[start + 3];
+  const digestLength = length - 4;
+  // RFC 9904 reserves digest identifiers 128-252; 253-254 are private-use.
+  if (digestType >= 128 && digestType <= 252) return false;
+  switch (digestType) {
+    case 0: return false; // Reserved for the CDS delete signal only.
+    case 1: return digestLength === 20; // SHA-1
+    case 2: case 3: case 5: case 6:
+      return digestLength === 32; // SHA-256, GOST, GOST 2012, SM3
+    case 4: return digestLength === 48; // SHA-384
+    default: return digestLength > 0; // Preserve unassigned and private-use digest types.
+  }
+}
+function validDNSKEYRdata(bytes, start, end, isChildDNSKEY) {
+  const length = end - start;
+  // DNSKEY/CDNSKEY have a two-octet flags field, protocol, algorithm and a
+  // non-empty public-key field. RFC 4034 fixes protocol to 3.
+  if (length < 5 || bytes[start + 2] !== 3) return false;
+  const algorithm = bytes[start + 3];
+  if (algorithm === 0) {
+    if (!isChildDNSKEY) return false; // Only CDNSKEY can carry the delete signal.
+    // RFC 8078's CDNSKEY delete signal is exactly CDNSKEY 0 3 0 0.
+    return length === 5 && bytes[start] === 0 && bytes[start + 1] === 0 && bytes[start + 4] === 0;
+  }
+  return !isReservedDNSSECAlgorithm(algorithm); // Keep unassigned/private algorithms opaque.
+}
+function validSSHFPData(bytes, start, end) {
+  const length = end - start;
+  if (length < 3 || bytes[start] === 0 || bytes[start + 1] === 0) return false;
+  const fingerprintLength = length - 2;
+  switch (bytes[start + 1]) {
+    case 1: return fingerprintLength === 20; // SHA-1
+    case 2: return fingerprintLength === 32; // SHA-256
+    default: return fingerprintLength > 0; // Preserve future fingerprint types.
+  }
+}
+function validTLSARdata(bytes, start, end) {
+  const length = end - start;
+  if (length < 4) return false;
+  const associationLength = length - 3;
+  switch (bytes[start + 2]) {
+    case 1: return associationLength === 32; // SHA-256
+    case 2: return associationLength === 64; // SHA-512
+    default: return associationLength > 0; // Raw data and future matching types.
+  }
+}
 
 // Validate RDATA formats that have well-defined framing. Unknown RR types stay
 // opaque (their formats may be defined by extensions the Worker does not know),
@@ -1106,13 +1174,15 @@ function validateKnownRdata(bytes, rr, nameBoundaries) {
       return pos === end;
     }
 
-    case 24: { // SIG: tolerate historical compression for receiver compatibility.
-      if (length < 20) return false;
+    case 24: { // SIG: validate algorithm and tolerate historical name compression.
+      if (length < 20 || bytes[start + 2] === 0
+          || isReservedDNSSECAlgorithm(bytes[start + 2])) return false;
       const signerEnd = rdataNameEndAt(bytes, start + 18, end, true, nameBoundaries);
       return signerEnd >= 0 && signerEnd < end;
     }
     case 46: { // RRSIG: signer name must not be compressed.
-      if (length < 20) return false;
+      if (length < 20 || bytes[start + 2] === 0
+          || isReservedDNSSECAlgorithm(bytes[start + 2])) return false;
       const signerEnd = rdataNameEndAt(bytes, start + 18, end, false, nameBoundaries);
       return signerEnd >= 0 && signerEnd < end;
     }
@@ -1125,14 +1195,20 @@ function validateKnownRdata(bytes, rr, nameBoundaries) {
       return nextName >= 0 && validRdataTypeBitmap(bytes, nextName, end);
     }
 
-    case 43: case 59: // DS/CDS: key tag, algorithm, digest type, digest
-      return length >= 5;
+    case 43: // DS: key tag, algorithm, digest type, digest
+      return validDSRdata(bytes, start, end, false);
+    case 59: // CDS: same format as DS, plus RFC 8078's exact delete signal.
+      return validDSRdata(bytes, start, end, true);
     case 44: // SSHFP: algorithm, fingerprint type, fingerprint
-      return length >= 3;
-    case 48: case 60: // DNSKEY/CDNSKEY: flags, protocol, algorithm, public key
+      return validSSHFPData(bytes, start, end);
+    case 48: // DNSKEY: flags, protocol, algorithm, public key
+      return validDNSKEYRdata(bytes, start, end, false);
+    case 60: // CDNSKEY: DNSKEY format plus the RFC 8078 delete signal.
+      return validDNSKEYRdata(bytes, start, end, true);
     case 49: // DHCID: identifier type, digest type, digest
-    case 52: case 53: // TLSA/SMIMEA: usage, selector, matching type, association data
       return length >= 4;
+    case 52: case 53: // TLSA/SMIMEA: usage, selector, matching type, association data
+      return validTLSARdata(bytes, start, end);
     case 45: { // IPSECKEY: validate defined gateway framing and null-key length.
       if (length < 3) return false;
       const gatewayType = bytes[start + 1];
@@ -1308,14 +1384,12 @@ async function getEdgeCache(key, origin, queryBytes, questionEnd, ctx) {
     // that is about to be purged never costs a body read.
     if (!Number.isFinite(storedAt) || storedAt > Date.now() + 5000
         || !Number.isInteger(ttlSeconds) || ttlSeconds <= 0 || ttlSeconds > CONFIG.EDGE_CACHE_MAX_TTL_SECONDS) {
-      discardBody(hit);
-      runInBackground(ctx, purgeEdgeCache(cache, cacheKey));
+      purgeEdgeEntry(ctx, cache, cacheKey, hit);
       return null;
     }
     const ageSeconds = cacheAgeSeconds(storedAt);
     if (ageSeconds >= ttlSeconds) {
-      discardBody(hit);
-      runInBackground(ctx, purgeEdgeCache(cache, cacheKey));
+      purgeEdgeEntry(ctx, cache, cacheKey, hit);
       return null;
     }
     const declaredLength = Number(hit.headers.get('content-length'));
@@ -1336,9 +1410,9 @@ async function getEdgeCache(key, origin, queryBytes, questionEnd, ctx) {
     // headers is purged and re-resolved upstream instead of being served.
     // The stored transaction ID is rewritten per request, so it is not part
     // of this check.
-    const validation = validateDNSMessage(new Uint8Array(body), { queryBytes, questionEnd });
+    const validation = validateDNSMessage(body, { queryBytes, questionEnd });
     if (!validation.ok || validation.metadata.ttl <= 0 || ttlSeconds > validation.metadata.ttl) {
-      runInBackground(ctx, purgeEdgeCache(cache, cacheKey));
+      purgeEdgeEntry(ctx, cache, cacheKey);
       return null;
     }
     return {
@@ -1351,10 +1425,7 @@ async function getEdgeCache(key, origin, queryBytes, questionEnd, ctx) {
     // A cache entry whose body or headers cannot be read would otherwise be
     // retried on every request until eviction. Purge it when a match was
     // obtained; a failure of cache.match itself remains a normal cache miss.
-    if (cache && cacheKey && hit) {
-      discardBody(hit);
-      runInBackground(ctx, purgeEdgeCache(cache, cacheKey));
-    }
+    if (cache && cacheKey && hit) purgeEdgeEntry(ctx, cache, cacheKey, hit);
     return null;
   }
 }
@@ -1362,6 +1433,12 @@ async function purgeEdgeCache(cache, cacheKey) {
   // Best-effort: drop corrupt/expired entries so requests stop paying a
   // cache.match + full body read until Cloudflare evicts them.
   try { await cache.delete(cacheKey); } catch (_) {}
+}
+// Schedules the purge of an L2 entry that will not be served. A match that
+// was obtained is discarded first so its body stream is not left open.
+function purgeEdgeEntry(ctx, cache, cacheKey, hit = null) {
+  if (hit) discardBody(hit);
+  runInBackground(ctx, purgeEdgeCache(cache, cacheKey));
 }
 async function putEdgeCache(key, body, ttlSeconds, storedAt, origin) {
   try {
@@ -1531,6 +1608,20 @@ function preflightResponse() {
     }
   });
 }
+function isGetOrHead(req) {
+  return req.method === 'GET' || req.method === 'HEAD';
+}
+function headResponse(req, response) {
+  if (req.method !== 'HEAD' || response.body === null) return response;
+  return new Response(null, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers
+  });
+}
+function methodNotAllowed() {
+  return textResponse('Method not allowed', 405, { allow: 'GET, HEAD', 'cache-control': 'no-store' });
+}
 function textResponse(text, status, headers = {}) {
   return new Response(text, {
     status,
@@ -1540,8 +1631,8 @@ function textResponse(text, status, headers = {}) {
     }
   });
 }
-function jsonResponse(data, status, headers = {}) {
-  return new Response(JSON.stringify(data, null, 2), {
+function jsonResponse(data, status, headers = {}, headOnly = false) {
+  return new Response(headOnly ? null : JSON.stringify(data), {
     status,
     headers: {
       'content-type': 'application/json; charset=utf-8',
@@ -1824,19 +1915,19 @@ function buildUITemplate() {
 // The page differs between requests only in its endpoint, so the last page
 // rendered is kept and reused while the endpoint stays the same.
 let UI_PAGE = { host: null, html: null };
-function renderUI(host) {
+function renderUI(host, headOnly = false) {
+  const headers = {
+    'content-type': 'text/html; charset=utf-8',
+    'cache-control': 'public, max-age=300',
+    'x-content-type-options': 'nosniff',
+    'referrer-policy': 'no-referrer',
+    'content-security-policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+  };
+  // HEAD returns the representation headers without building or sending HTML.
+  if (headOnly) return new Response(null, { status: 200, headers });
   if (UI_PAGE.host !== host) {
     const endpoint = escapeHtml(`https://${host}${CONFIG.DNS_PATH}`);
     UI_PAGE = { host, html: getUITemplate().join(endpoint) };
   }
-  return new Response(UI_PAGE.html, {
-    status: 200,
-    headers: {
-      'content-type': 'text/html; charset=utf-8',
-      'cache-control': 'public, max-age=300',
-      'x-content-type-options': 'nosniff',
-      'referrer-policy': 'no-referrer',
-      'content-security-policy': "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
-    }
-  });
+  return new Response(UI_PAGE.html, { status: 200, headers });
 }

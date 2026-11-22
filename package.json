@@ -8,6 +8,6 @@
   },
   "scripts": {
     "test": "node --test",
-    "check": "npx --yes wrangler@4.151.0 deploy --dry-run --outdir .wrangler-dry-run"
+    "check": "npx --yes wrangler@4.166.0 deploy --dry-run --outdir .wrangler-dry-run"
   }
 }
